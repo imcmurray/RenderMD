@@ -17,6 +17,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/imcmurray/RenderMD/actions/workflows/check.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/check.yml/badge.svg" alt="Check (fmt, clippy, build, test)"></a>
+</p>
+
+<p align="center">
   <a href="https://github.com/imcmurray/RenderMD/actions/workflows/build-deb.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/build-deb.yml/badge.svg" alt="Build .deb (Ubuntu)"></a>
   <a href="https://github.com/imcmurray/RenderMD/actions/workflows/build-rpm.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/build-rpm.yml/badge.svg" alt="Build .rpm (Fedora)"></a>
   <a href="https://github.com/imcmurray/RenderMD/actions/workflows/build-arch.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/build-arch.yml/badge.svg" alt="Build pacman (Arch)"></a>

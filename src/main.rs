@@ -290,7 +290,11 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
     options.render.github_pre_lang = true;
 
     // Pick a syntect theme that flips with light/dark.
-    let theme = if dark { "base16-ocean.dark" } else { "InspiredGitHub" };
+    let theme = if dark {
+        "base16-ocean.dark"
+    } else {
+        "InspiredGitHub"
+    };
     let adapter = SyntectAdapter::new(Some(theme));
     let mut plugins = ComrakPlugins::default();
     plugins.render.codefence_syntax_highlighter = Some(&adapter);
@@ -316,14 +320,17 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
         Some(dir) => {
             let path_str = dir.to_string_lossy();
             // Keep '/' unescaped so the resulting URI is well-formed.
-            let escaped =
-                glib::Uri::escape_string(&path_str, Some("/"), false).to_string();
+            let escaped = glib::Uri::escape_string(&path_str, Some("/"), false).to_string();
             format!("file://{}/", escaped)
         }
         None => String::new(),
     };
 
-    let theme_css = if dark { PREVIEW_CSS_DARK } else { PREVIEW_CSS_LIGHT };
+    let theme_css = if dark {
+        PREVIEW_CSS_DARK
+    } else {
+        PREVIEW_CSS_LIGHT
+    };
     let title_safe = if title.is_empty() {
         APP_NAME.to_string()
     } else {
@@ -423,7 +430,8 @@ impl State {
         let new_btn = gtk::Button::from_icon_name("document-new-symbolic");
         new_btn.set_tooltip_text(Some("New (Ctrl+N)"));
         new_btn.connect_clicked(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |_| state.action_new()
         ));
         header.pack_start(&new_btn);
@@ -431,7 +439,8 @@ impl State {
         let open_btn = gtk::Button::from_icon_name("document-open-symbolic");
         open_btn.set_tooltip_text(Some("Open\u{2026} (Ctrl+O)"));
         open_btn.connect_clicked(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |_| state.action_open()
         ));
         header.pack_start(&open_btn);
@@ -439,7 +448,8 @@ impl State {
         let save_btn = gtk::Button::from_icon_name("document-save-symbolic");
         save_btn.set_tooltip_text(Some("Save (Ctrl+S)"));
         save_btn.connect_clicked(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |_| state.action_save()
         ));
         header.pack_start(&save_btn);
@@ -460,9 +470,14 @@ impl State {
         toggle_box.append(&s.toggle_label);
         s.toggle_btn.set_child(Some(&toggle_box));
         let handler_id = s.toggle_btn.connect_toggled(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |btn| {
-                let target = if btn.is_active() { MODE_EDIT } else { MODE_PREVIEW };
+                let target = if btn.is_active() {
+                    MODE_EDIT
+                } else {
+                    MODE_PREVIEW
+                };
                 state.set_mode(target, false);
             }
         ));
@@ -470,7 +485,8 @@ impl State {
         header.pack_end(&s.toggle_btn);
 
         // Stack for content
-        s.stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+        s.stack
+            .set_transition_type(gtk::StackTransitionType::Crossfade);
         s.stack.set_transition_duration(140);
         toolbar_view.set_content(Some(&s.stack));
 
@@ -481,12 +497,14 @@ impl State {
             ws.set_enable_javascript(true);
         }
         let bg = if self.is_dark() { "#1e1e2e" } else { "#ffffff" };
-        if let Some(rgba) = gdk::RGBA::parse(bg).ok() {
+        if let Ok(rgba) = gdk::RGBA::parse(bg) {
             s.webview.set_background_color(&rgba);
         }
         s.webview.connect_decide_policy(clone!(
-            #[weak(rename_to = window)] s.window,
-            #[upgrade_or] false,
+            #[weak(rename_to = window)]
+            s.window,
+            #[upgrade_or]
+            false,
             move |_, decision, decision_type| on_webview_policy(&window, decision, decision_type)
         ));
         // (function below takes references — matches the signal signature.)
@@ -505,7 +523,8 @@ impl State {
         s.buffer.set_highlight_matching_brackets(true);
         self.apply_source_style_scheme();
         let buffer_handler_id = s.buffer.connect_changed(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |_| state.on_buffer_changed()
         ));
         *s.buffer_handler.borrow_mut() = Some(buffer_handler_id);
@@ -551,13 +570,15 @@ impl State {
         // Track theme changes live
         let style_manager = adw::StyleManager::default();
         style_manager.connect_dark_notify(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |_| state.on_theme_changed()
         ));
 
         // Confirm-on-close
         s.window.connect_close_request(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |_| state.on_close_request()
         ));
     }
@@ -583,22 +604,32 @@ impl State {
 
         let help_section = gio::Menu::new();
         help_section.append(Some("Keyboard Shortcuts"), Some("win.shortcuts"));
-        help_section.append(
-            Some(&format!("About {}", APP_NAME)),
-            Some("win.about"),
-        );
+        help_section.append(Some(&format!("About {}", APP_NAME)), Some("win.about"));
         menu.append_section(Some("Help"), &help_section);
 
         menu
     }
 
+    #[allow(clippy::type_complexity)] // local action table; factoring out hurts readability
     fn wire_actions(&self, app: &adw::Application) {
         let s = &self.inner;
 
         let actions: Vec<(&str, Box<dyn Fn(&Self)>, &[&str])> = vec![
-            ("new", Box::new(|st: &State| st.action_new()), &["<Primary>n"]),
-            ("open", Box::new(|st: &State| st.action_open()), &["<Primary>o"]),
-            ("save", Box::new(|st: &State| st.action_save()), &["<Primary>s"]),
+            (
+                "new",
+                Box::new(|st: &State| st.action_new()),
+                &["<Primary>n"],
+            ),
+            (
+                "open",
+                Box::new(|st: &State| st.action_open()),
+                &["<Primary>o"],
+            ),
+            (
+                "save",
+                Box::new(|st: &State| st.action_save()),
+                &["<Primary>s"],
+            ),
             (
                 "save-as",
                 Box::new(|st: &State| st.action_save_as()),
@@ -636,8 +667,11 @@ impl State {
         // Quit / close: special-case so we go through the close-request flow.
         let quit_action = gio::SimpleAction::new("quit", None);
         quit_action.connect_activate(clone!(
-            #[strong(rename_to = state)] self,
-            move |_, _| { state.inner.window.close(); }
+            #[strong(rename_to = state)]
+            self,
+            move |_, _| {
+                state.inner.window.close();
+            }
         ));
         s.window.add_action(&quit_action);
         app.set_accels_for_action("win.quit", &["<Primary>q", "<Primary>w"]);
@@ -646,16 +680,22 @@ impl State {
     fn setup_drag_and_drop(&self) {
         let target = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
         target.connect_drop(clone!(
-            #[strong(rename_to = state)] self,
+            #[strong(rename_to = state)]
+            self,
             move |_, value, _, _| {
                 let Ok(file_list) = value.get::<gdk::FileList>() else {
                     return false;
                 };
                 let files = file_list.files();
-                let Some(first) = files.first() else { return false };
-                let Some(path) = first.path() else { return false };
+                let Some(first) = files.first() else {
+                    return false;
+                };
+                let Some(path) = first.path() else {
+                    return false;
+                };
                 state.maybe_save_then(Box::new(clone!(
-                    #[strong] state,
+                    #[strong]
+                    state,
                     move || state.open_path(&path)
                 )));
                 true
@@ -941,7 +981,11 @@ impl State {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled".to_string());
-        let prefix = if self.inner.is_modified.get() { "\u{2022} " } else { "" };
+        let prefix = if self.inner.is_modified.get() {
+            "\u{2022} "
+        } else {
+            ""
+        };
         self.inner
             .window
             .set_title(Some(&format!("{}{} \u{2014} {}", prefix, name, APP_NAME)));
@@ -993,31 +1037,29 @@ impl State {
 
         let then = Rc::new(then);
         let state = self.clone();
-        dialog.connect_response(None, move |_, response| {
-            match response {
-                "save" => {
-                    let then = then.clone();
-                    let state2 = state.clone();
-                    if state.inner.current_file.borrow().is_none() {
-                        state.save_as_then(Box::new(move || {
-                            if !state2.inner.is_modified.get() {
-                                then();
-                            }
-                        }));
-                    } else {
-                        let path = state.inner.current_file.borrow().clone().unwrap();
-                        state.write_to(&path);
-                        if !state.inner.is_modified.get() {
+        dialog.connect_response(None, move |_, response| match response {
+            "save" => {
+                let then = then.clone();
+                let state2 = state.clone();
+                if state.inner.current_file.borrow().is_none() {
+                    state.save_as_then(Box::new(move || {
+                        if !state2.inner.is_modified.get() {
                             then();
                         }
+                    }));
+                } else {
+                    let path = state.inner.current_file.borrow().clone().unwrap();
+                    state.write_to(&path);
+                    if !state.inner.is_modified.get() {
+                        then();
                     }
                 }
-                "discard" => {
-                    state.mark_clean();
-                    then();
-                }
-                _ => {}
             }
+            "discard" => {
+                state.mark_clean();
+                then();
+            }
+            _ => {}
         });
         dialog.present(Some(&self.inner.window));
     }
@@ -1134,7 +1176,7 @@ impl State {
 
     fn save_window_state(&self) {
         let dir = settings_dir();
-        if let Err(_) = fs::create_dir_all(&dir) {
+        if fs::create_dir_all(&dir).is_err() {
             return;
         }
         let kf = glib::KeyFile::new();
@@ -1153,7 +1195,9 @@ impl State {
 // locations so this works whether you ran `cargo run`, `./rendermd` from the
 // project root, or installed the binary somewhere else.
 fn register_icon_search_paths() {
-    let Some(display) = gdk::Display::default() else { return };
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
     let theme = gtk::IconTheme::for_display(&display);
 
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -1195,8 +1239,12 @@ fn on_webview_policy(
     if action.navigation_type() != webkit6::NavigationType::LinkClicked {
         return false;
     }
-    let Some(request) = action.request() else { return false };
-    let Some(uri) = request.uri() else { return false };
+    let Some(request) = action.request() else {
+        return false;
+    };
+    let Some(uri) = request.uri() else {
+        return false;
+    };
     let uri_str = uri.as_str();
     if uri_str.is_empty() || uri_str.starts_with("about:") {
         return false;
@@ -1209,7 +1257,7 @@ fn on_webview_policy(
 
 // ---- Active-or-new window tracking -----------------------------------------
 thread_local! {
-    static STATE: RefCell<Option<State>> = RefCell::new(None);
+    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
 }
 
 fn ensure_state(app: &adw::Application) -> State {
@@ -1265,4 +1313,164 @@ fn main() -> glib::ExitCode {
     });
 
     app.run()
+}
+
+// ---- Tests ------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preprocess_no_fences() {
+        let (out, had) = preprocess_mermaid_blocks("# hi\n\nplain text\n");
+        assert!(!had);
+        assert!(out.contains("# hi"));
+        assert!(out.contains("plain text"));
+        assert!(!out.contains("class=\"mermaid\""));
+    }
+
+    #[test]
+    fn preprocess_simple_block() {
+        let input = "before\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\nafter\n";
+        let (out, had) = preprocess_mermaid_blocks(input);
+        assert!(had);
+        assert!(out.contains(r#"<pre class="mermaid">"#));
+        assert!(out.contains("</pre>"));
+        assert!(out.contains("flowchart TD"));
+        assert!(
+            out.contains("A --&gt; B"),
+            "diagram body should be HTML-escaped"
+        );
+        assert!(out.contains("before") && out.contains("after"));
+    }
+
+    #[test]
+    fn preprocess_blank_lines_inside() {
+        // Regression for issue #1: a multi-section flowchart with a blank line
+        // between sections must be preserved as a single mermaid block, not
+        // sliced at the blank line.
+        let input = "```mermaid\nflowchart TD\n  A --> B\n\n  C --> D\n```\n";
+        let (out, _) = preprocess_mermaid_blocks(input);
+        // The opening <pre> and closing </pre> must bracket BOTH sections.
+        let open = out
+            .find(r#"<pre class="mermaid">"#)
+            .expect("opening tag present");
+        let close = out.find("</pre>").expect("closing tag present");
+        assert!(open < close);
+        let body = &out[open..close];
+        assert!(body.contains("A --&gt; B"));
+        assert!(body.contains("C --&gt; D"));
+    }
+
+    #[test]
+    fn preprocess_unclosed_fence() {
+        // Unclosed fence: don't lose user content, restore as-is.
+        let input = "before\n\n```mermaid\nflowchart TD\n  A --> B\n";
+        let (out, had) = preprocess_mermaid_blocks(input);
+        assert!(!had, "unclosed fence shouldn't count as a mermaid block");
+        assert!(out.contains("```mermaid"));
+        assert!(out.contains("flowchart TD"));
+        assert!(!out.contains(r#"<pre class="mermaid">"#));
+    }
+
+    #[test]
+    fn preprocess_indented_fence_current_behavior() {
+        // TODO: CommonMark spec says fences with 4+ spaces of indent are an
+        // indented code block, not a fence. Current implementation uses
+        // line.trim() so it matches any indent. This test pins the current
+        // behavior; tighten if/when we hew closer to spec.
+        let input = "    ```mermaid\n    flowchart TD\n    ```\n";
+        let (_, had) = preprocess_mermaid_blocks(input);
+        assert!(had, "current implementation matches indented fences");
+    }
+
+    #[test]
+    fn preprocess_html_escapes_diagram() {
+        let input = "```mermaid\nA[<b>x</b> & \"y\"]\n```\n";
+        let (out, _) = preprocess_mermaid_blocks(input);
+        assert!(out.contains("&lt;b&gt;"));
+        assert!(out.contains("&amp;"));
+        assert!(out.contains("&quot;"));
+        assert!(!out.contains("<b>x</b>"));
+    }
+
+    #[test]
+    fn html_escape_entities() {
+        assert_eq!(html_escape("&"), "&amp;");
+        assert_eq!(html_escape("<"), "&lt;");
+        assert_eq!(html_escape(">"), "&gt;");
+        assert_eq!(html_escape("\""), "&quot;");
+        assert_eq!(html_escape("'"), "&#39;");
+        assert_eq!(
+            html_escape("a < b && c > d"),
+            "a &lt; b &amp;&amp; c &gt; d"
+        );
+    }
+
+    #[test]
+    fn render_smoke_no_mermaid() {
+        let html = render_markdown_to_html("# hello\n\ntext", None, false, "doc");
+        assert!(html.contains("<h1"));
+        assert!(html.contains("hello"));
+        // Bundle marker — first ~30 chars of MERMAID_BUNDLE that wouldn't
+        // appear by accident in a normal doc:
+        let bundle_fingerprint = &MERMAID_BUNDLE[..30.min(MERMAID_BUNDLE.len())];
+        assert!(
+            !html.contains(bundle_fingerprint),
+            "Mermaid bundle should not be injected when no mermaid blocks are present"
+        );
+    }
+
+    #[test]
+    fn render_injects_mermaid_when_present() {
+        let html = render_markdown_to_html(
+            "```mermaid\nflowchart TD\n  A --> B\n```\n",
+            None,
+            false,
+            "doc",
+        );
+        assert!(
+            html.contains("mermaid.run()"),
+            "init script should be injected"
+        );
+        let bundle_fingerprint = &MERMAID_BUNDLE[..30.min(MERMAID_BUNDLE.len())];
+        assert!(
+            html.contains(bundle_fingerprint),
+            "bundle should be injected"
+        );
+    }
+
+    #[test]
+    fn render_base_href_set_when_dir_given() {
+        let dir = std::path::Path::new("/tmp/somewhere");
+        let html = render_markdown_to_html("hi", Some(dir), false, "doc");
+        assert!(html.contains(r#"<base href="file:///tmp/somewhere/">"#));
+    }
+
+    #[test]
+    fn render_base_href_empty_when_no_dir() {
+        let html = render_markdown_to_html("hi", None, false, "doc");
+        assert!(html.contains(r#"<base href="">"#));
+    }
+
+    #[test]
+    fn render_dark_theme_picks_dark_css() {
+        let dark = render_markdown_to_html("hi", None, true, "doc");
+        let light = render_markdown_to_html("hi", None, false, "doc");
+        // The two themes diverge in their CSS variable values; confirm we get
+        // different output for the two flags.
+        assert_ne!(dark, light);
+        // Sanity: both contain the shared base CSS.
+        assert!(dark.contains(":root"));
+        assert!(light.contains(":root"));
+    }
+
+    #[test]
+    fn render_mermaid_theme_follows_dark_flag() {
+        let input = "```mermaid\nflowchart TD\nA --> B\n```\n";
+        let dark = render_markdown_to_html(input, None, true, "doc");
+        let light = render_markdown_to_html(input, None, false, "doc");
+        assert!(dark.contains("theme: 'dark'"));
+        assert!(light.contains("theme: 'default'"));
+    }
 }
