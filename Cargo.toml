@@ -15,6 +15,7 @@ adw = { version = "0.8", package = "libadwaita", features = ["v1_5"] }
 sourceview5 = { version = "0.10", features = ["v5_10"] }
 webkit6 = "0.5"
 comrak = { version = "0.29", features = ["syntect"] }
+notify = "6"
 
 [profile.release]
 opt-level = 3

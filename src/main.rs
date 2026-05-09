@@ -6,12 +6,15 @@ use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use comrak::plugins::syntect::SyntectAdapter;
 use comrak::{markdown_to_html_with_plugins, ComrakOptions, ComrakPlugins};
 use gtk::glib::{self, clone};
 use gtk::{gdk, gio, pango};
+use notify::Watcher;
 use sourceview5::prelude::*;
 use webkit6::prelude::*;
 
@@ -353,6 +356,7 @@ struct StateInner {
     buffer: sourceview5::Buffer,
     source_view: sourceview5::View,
     stack: gtk::Stack,
+    toast_overlay: adw::ToastOverlay,
     toggle_btn: gtk::ToggleButton,
     toggle_icon: gtk::Image,
     toggle_label: gtk::Label,
@@ -365,6 +369,14 @@ struct StateInner {
     suppress_modify: Cell<bool>,
     toggle_handler: RefCell<Option<glib::SignalHandlerId>>,
     buffer_handler: RefCell<Option<glib::SignalHandlerId>>,
+
+    // External-change watcher: notify::Watcher runs on its own thread; the
+    // glib timeout pumps events onto the GTK main thread and coalesces
+    // bursts. last_self_write is bumped before our own atomic save so the
+    // resulting inotify event doesn't bounce back as an "external change."
+    watcher: RefCell<Option<notify::RecommendedWatcher>>,
+    watch_source_id: RefCell<Option<glib::SourceId>>,
+    last_self_write: Cell<Instant>,
 }
 
 #[derive(Clone)]
@@ -385,6 +397,7 @@ impl State {
         let buffer = sourceview5::Buffer::new(None);
         let source_view = sourceview5::View::with_buffer(&buffer);
         let stack = gtk::Stack::new();
+        let toast_overlay = adw::ToastOverlay::new();
         let toggle_btn = gtk::ToggleButton::new();
         let toggle_icon = gtk::Image::from_icon_name("document-edit-symbolic");
         let toggle_label = gtk::Label::new(Some("Edit"));
@@ -397,6 +410,7 @@ impl State {
             buffer,
             source_view,
             stack,
+            toast_overlay,
             toggle_btn,
             toggle_icon,
             toggle_label,
@@ -408,6 +422,9 @@ impl State {
             suppress_modify: Cell::new(false),
             toggle_handler: RefCell::new(None),
             buffer_handler: RefCell::new(None),
+            watcher: RefCell::new(None),
+            watch_source_id: RefCell::new(None),
+            last_self_write: Cell::new(Instant::now()),
         };
 
         State {
@@ -488,7 +505,8 @@ impl State {
         s.stack
             .set_transition_type(gtk::StackTransitionType::Crossfade);
         s.stack.set_transition_duration(140);
-        toolbar_view.set_content(Some(&s.stack));
+        s.toast_overlay.set_child(Some(&s.stack));
+        toolbar_view.set_content(Some(&s.toast_overlay));
 
         // --- Preview page ---
         if let Some(ws) = webkit6::prelude::WebViewExt::settings(&s.webview) {
@@ -933,6 +951,9 @@ impl State {
             self.error_dialog("Could not save file", &e.to_string());
             return;
         }
+        // Stamp before the rename so the watcher's resulting event is
+        // suppressed (the 1500 ms window in start_watching's timer).
+        self.inner.last_self_write.set(Instant::now());
         if let Err(e) = fs::rename(&tmp, path) {
             self.error_dialog("Could not save file", &e.to_string());
             return;
@@ -950,9 +971,136 @@ impl State {
         self.inner.suppress_modify.set(true);
         self.inner.buffer.set_text(text);
         self.inner.suppress_modify.set(false);
-        *self.inner.current_file.borrow_mut() = path;
+        *self.inner.current_file.borrow_mut() = path.clone();
         self.mark_clean();
         self.update_title();
+        self.update_watch(path.as_deref());
+    }
+
+    // -- External-change watcher -----------------------------------------
+    fn update_watch(&self, path: Option<&Path>) {
+        self.stop_watching();
+        if let Some(p) = path {
+            self.start_watching(p);
+        }
+    }
+
+    fn start_watching(&self, path: &Path) {
+        // Watch the parent directory rather than the file itself: editors
+        // (vim, VSCode, our own atomic save) replace files via tmp+rename,
+        // which deletes the original inode and would orphan a file-level
+        // watch. NonRecursive keeps us from snooping siblings unnecessarily.
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let target_name = match path.file_name() {
+            Some(n) => n.to_os_string(),
+            None => return,
+        };
+
+        let (tx, rx) = mpsc::channel::<()>();
+
+        let mut watcher: notify::RecommendedWatcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    let touches_target = event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name() == Some(&target_name));
+                    if touches_target {
+                        let _ = tx.send(());
+                    }
+                }
+            }) {
+                Ok(w) => w,
+                Err(_) => return,
+            };
+
+        if watcher
+            .watch(&parent, notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
+        }
+        *self.inner.watcher.borrow_mut() = Some(watcher);
+
+        // 150 ms timer pulls events from notify's worker thread onto the
+        // main loop and coalesces inotify bursts (a single save can fire
+        // CREATE+MODIFY+ATTRIB+RENAME) into one reload.
+        let st = self.clone();
+        let source_id = glib::timeout_add_local(Duration::from_millis(150), move || {
+            let mut got_event = false;
+            while rx.try_recv().is_ok() {
+                got_event = true;
+            }
+            if got_event && st.inner.last_self_write.get().elapsed() > Duration::from_millis(1500) {
+                st.on_external_change();
+            }
+            glib::ControlFlow::Continue
+        });
+        *self.inner.watch_source_id.borrow_mut() = Some(source_id);
+    }
+
+    fn stop_watching(&self) {
+        if let Some(source_id) = self.inner.watch_source_id.take() {
+            source_id.remove();
+        }
+        *self.inner.watcher.borrow_mut() = None;
+    }
+
+    fn on_external_change(&self) {
+        let path = match self.inner.current_file.borrow().clone() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let in_edit = self.inner.mode.borrow().as_str() == MODE_EDIT;
+        let dirty = self.inner.is_modified.get();
+
+        if in_edit && dirty {
+            // Don't clobber unsaved edits — surface a Reload prompt.
+            self.show_reload_toast();
+            return;
+        }
+        self.reload_from_disk(&path);
+    }
+
+    fn reload_from_disk(&self, path: &Path) {
+        let text = match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => match fs::read(path) {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(_) => {
+                    self.show_toast(&format!("{} is no longer readable", path.display()));
+                    return;
+                }
+            },
+        };
+        self.load_text(&text, Some(path.to_path_buf()));
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
+    }
+
+    fn show_toast(&self, message: &str) {
+        let toast = adw::Toast::new(message);
+        toast.set_timeout(4);
+        self.inner.toast_overlay.add_toast(toast);
+    }
+
+    fn show_reload_toast(&self) {
+        let toast = adw::Toast::new("File changed on disk — discard your edits?");
+        toast.set_button_label(Some("Reload"));
+        toast.set_timeout(0);
+        let st = self.clone();
+        toast.connect_button_clicked(move |t| {
+            if let Some(p) = st.inner.current_file.borrow().clone() {
+                st.reload_from_disk(&p);
+            }
+            t.dismiss();
+        });
+        self.inner.toast_overlay.add_toast(toast);
     }
 
     fn buffer_text(&self) -> String {
