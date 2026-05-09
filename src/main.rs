@@ -38,6 +38,11 @@ const PREVIEW_CSS_LIGHT: &str = r#"
   --table-stripe: #f6f8fa;
   --quote-bg: #f6f8fa;
   --quote-bar: #d1d9e0;
+  --alert-note: #0969da;
+  --alert-tip: #1a7f37;
+  --alert-important: #8250df;
+  --alert-warning: #9a6700;
+  --alert-caution: #cf222e;
 }
 "#;
 
@@ -54,6 +59,11 @@ const PREVIEW_CSS_DARK: &str = r#"
   --table-stripe: #161b22;
   --quote-bg: #161b22;
   --quote-bar: #30363d;
+  --alert-note: #79b8ff;
+  --alert-tip: #3fb950;
+  --alert-important: #a371f7;
+  --alert-warning: #d29922;
+  --alert-caution: #f85149;
 }
 "#;
 
@@ -164,6 +174,34 @@ img {
   height: auto;
   border-radius: 6px;
 }
+
+.alert {
+  border-left: 4px solid;
+  padding: 8px 16px;
+  margin: 1em 0;
+  border-radius: 0 6px 6px 0;
+  background: var(--code-bg);
+}
+.alert-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.alert-title svg { width: 16px; height: 16px; flex-shrink: 0; }
+.alert > p:first-of-type { margin-top: 0; }
+.alert > p:last-of-type { margin-bottom: 0; }
+.alert-note { border-color: var(--alert-note); }
+.alert-note .alert-title { color: var(--alert-note); }
+.alert-tip { border-color: var(--alert-tip); }
+.alert-tip .alert-title { color: var(--alert-tip); }
+.alert-important { border-color: var(--alert-important); }
+.alert-important .alert-title { color: var(--alert-important); }
+.alert-warning { border-color: var(--alert-warning); }
+.alert-warning .alert-title { color: var(--alert-warning); }
+.alert-caution { border-color: var(--alert-caution); }
+.alert-caution .alert-title { color: var(--alert-caution); }
 "#;
 
 const HTML_TEMPLATE: &str = r#"<!doctype html>
@@ -503,6 +541,112 @@ fn preprocess_emoji(text: &str) -> String {
     out
 }
 
+// GitHub-style alerts: > [!NOTE]/[!TIP]/[!IMPORTANT]/[!WARNING]/[!CAUTION]
+// followed by `> body...` lines. Comrak doesn't ship this extension, so we
+// detect openers, collect blockquote continuations, render the body to HTML
+// recursively (without the syntect plugin to keep alerts free of nested
+// concerns), and emit a single-line <div class="alert alert-X">…</div>.
+//
+// Why single-line: <div> is a CommonMark "type 6" HTML block — terminates
+// at the next blank line. If the rendered body had its own newlines (which
+// it does: comrak emits paragraphs separated by \n), the block would close
+// mid-alert. Replacing newlines with spaces in the rendered HTML keeps the
+// whole alert as one logical line that comrak passes through verbatim.
+
+// Octicons (MIT-licensed) — rough matches for what GitHub uses on alerts.
+const ALERT_ICON_NOTE: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"/></svg>"##;
+
+const ALERT_ICON_TIP: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM6 15.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1-.75-.75Z"/></svg>"##;
+
+const ALERT_ICON_IMPORTANT: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0 1 14.25 13H8.06l-2.573 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25Zm7 2.25v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 9a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"/></svg>"##;
+
+const ALERT_ICON_WARNING: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"/></svg>"##;
+
+const ALERT_ICON_CAUTION: &str = r##"<svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25A.749.749 0 0 1 11 16H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"/></svg>"##;
+
+// Variants table: (token, lowercase variant for CSS class, label, icon).
+const ALERT_VARIANTS: &[(&str, &str, &str, &str)] = &[
+    ("[!NOTE]", "note", "Note", ALERT_ICON_NOTE),
+    ("[!TIP]", "tip", "Tip", ALERT_ICON_TIP),
+    (
+        "[!IMPORTANT]",
+        "important",
+        "Important",
+        ALERT_ICON_IMPORTANT,
+    ),
+    ("[!WARNING]", "warning", "Warning", ALERT_ICON_WARNING),
+    ("[!CAUTION]", "caution", "Caution", ALERT_ICON_CAUTION),
+];
+
+fn detect_alert_opener(
+    line: &str,
+) -> Option<&'static (&'static str, &'static str, &'static str, &'static str)> {
+    let trimmed = line.trim();
+    let after_gt = trimmed.strip_prefix('>')?.trim();
+    ALERT_VARIANTS.iter().find(|v| after_gt == v.0)
+}
+
+fn strip_blockquote_prefix(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('>') {
+        // Per CommonMark, a single optional space after `>` is part of the
+        // marker and should be stripped.
+        rest.strip_prefix(' ').unwrap_or(rest).to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+fn render_alert_body(body: &str) -> String {
+    // Comrak with the same GFM extensions as the main pipeline minus the
+    // syntect plugin (alerts almost never carry highlighted code blocks,
+    // and skipping syntect keeps the body cheap to render).
+    let mut options = ComrakOptions::default();
+    options.extension.strikethrough = true;
+    options.extension.table = true;
+    options.extension.autolink = true;
+    options.extension.tasklist = true;
+    options.extension.superscript = true;
+    options.parse.smart = true;
+    options.render.unsafe_ = true;
+    comrak::markdown_to_html(body, &options)
+}
+
+fn preprocess_alerts(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut iter = text.lines().peekable();
+
+    while let Some(line) = iter.next() {
+        if let Some(&(_, variant, label, icon)) = detect_alert_opener(line) {
+            // Collect continuation lines (blockquote-prefixed).
+            let mut body_lines: Vec<String> = Vec::new();
+            while let Some(peek) = iter.peek() {
+                if !peek.trim_start().starts_with('>') {
+                    break;
+                }
+                body_lines.push(strip_blockquote_prefix(peek));
+                iter.next();
+            }
+            let body_md = body_lines.join("\n");
+            let body_html = render_alert_body(&body_md);
+            // Flatten newlines so the resulting <div> survives CommonMark's
+            // type-6 block parsing (which terminates on a blank line).
+            let body_oneline = body_html.replace('\n', " ");
+
+            out.push('\n');
+            out.push_str(&format!(
+                "<div class=\"alert alert-{}\"><div class=\"alert-title\">{} <span>{}</span></div>{}</div>",
+                variant, icon, label, body_oneline
+            ));
+            out.push_str("\n\n");
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 // Convert ```mermaid fences to <div class="mermaid">SOURCE</div> raw HTML
 // before comrak runs. Doing this at the markdown level (rather than
 // post-processing comrak's output) sidesteps the SyntectAdapter wrapping
@@ -589,7 +733,8 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
     plugins.render.codefence_syntax_highlighter = Some(&adapter);
 
     let with_emoji = preprocess_emoji(text);
-    let (preprocessed, had_mermaid) = preprocess_mermaid_blocks(&with_emoji);
+    let with_alerts = preprocess_alerts(&with_emoji);
+    let (preprocessed, had_mermaid) = preprocess_mermaid_blocks(&with_alerts);
     let body = markdown_to_html_with_plugins(&preprocessed, &options, &plugins);
 
     let mermaid_script = if had_mermaid {
@@ -2147,6 +2292,92 @@ mod tests {
     fn emoji_lone_colons_pass_through() {
         let out = replace_shortcodes_in_line("ratio 4:3 and time 12:30:45");
         assert_eq!(out, "ratio 4:3 and time 12:30:45");
+    }
+
+    #[test]
+    fn alert_note_emits_div() {
+        let out = preprocess_alerts("> [!NOTE]\n> Hello there.\n");
+        assert!(out.contains(r#"<div class="alert alert-note">"#));
+        assert!(out.contains("<span>Note</span>"));
+        assert!(out.contains("Hello there."));
+    }
+
+    #[test]
+    fn alert_each_variant_recognized() {
+        for (token, variant, label, _) in ALERT_VARIANTS {
+            let input = format!("> {}\n> body\n", token);
+            let out = preprocess_alerts(&input);
+            assert!(
+                out.contains(&format!(r#"alert-{}""#, variant)),
+                "missing class for {}",
+                token
+            );
+            assert!(
+                out.contains(&format!("<span>{}</span>", label)),
+                "missing label for {}",
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn alert_collects_multiline_body() {
+        let input = "> [!WARNING]\n> first line\n> second line\n> third line\n";
+        let out = preprocess_alerts(input);
+        // The whole alert must live on one line so the <div> survives
+        // CommonMark's blank-line termination of HTML blocks.
+        let div_start = out.find("<div class=\"alert").unwrap();
+        let line_end = out[div_start..]
+            .find('\n')
+            .map(|i| div_start + i)
+            .unwrap_or(out.len());
+        let alert_line = &out[div_start..line_end];
+        assert!(alert_line.contains("first line"));
+        assert!(alert_line.contains("second line"));
+        assert!(alert_line.contains("third line"));
+        assert!(alert_line.ends_with("</div>"));
+    }
+
+    #[test]
+    fn alert_terminates_at_non_blockquote_line() {
+        let input = "> [!NOTE]\n> inside\nafter\n";
+        let out = preprocess_alerts(input);
+        let div_start = out.find("<div class=\"alert").unwrap();
+        let line_end = out[div_start..]
+            .find('\n')
+            .map(|i| div_start + i)
+            .unwrap_or(out.len());
+        let alert_line = &out[div_start..line_end];
+        assert!(alert_line.contains("inside"));
+        // "after" must NOT be inside the alert; it should be a separate line below.
+        assert!(!alert_line.contains("after"));
+        assert!(out[line_end..].contains("after"));
+    }
+
+    #[test]
+    fn alert_unknown_variant_passes_through_as_blockquote() {
+        // [!FOOBAR] is not a known variant — leave the lines untouched
+        // so comrak renders them as a regular blockquote.
+        let input = "> [!FOOBAR]\n> body\n";
+        let out = preprocess_alerts(input);
+        assert!(out.contains("[!FOOBAR]"));
+        assert!(!out.contains("class=\"alert"));
+    }
+
+    #[test]
+    fn alert_case_sensitive_matches_github() {
+        // Lowercase shouldn't match.
+        let out = preprocess_alerts("> [!note]\n> body\n");
+        assert!(!out.contains("class=\"alert"));
+    }
+
+    #[test]
+    fn alert_inline_emoji_in_body_renders() {
+        // emoji preprocessing runs first, so the body has 🚀 by the time we
+        // collect it.
+        let input = "> [!TIP]\n> Ship it 🚀\n";
+        let out = preprocess_alerts(input);
+        assert!(out.contains("🚀"));
     }
 
     #[test]
