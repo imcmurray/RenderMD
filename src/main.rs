@@ -176,8 +176,31 @@ const HTML_TEMPLATE: &str = r#"<!doctype html>
 </head>
 <body>
 {BODY}
+{MERMAID_SCRIPT}
 </body>
 </html>
+"#;
+
+// Mermaid.js UMD bundle, embedded so preview works offline. Only injected
+// into the page when the document actually contains a mermaid fence.
+const MERMAID_BUNDLE: &str = include_str!("../data/js/mermaid.min.js");
+
+const MERMAID_INIT_JS: &str = r#"
+(function() {
+  // Source blocks come through as <pre class="mermaid">...</pre> (a CommonMark
+  // type-1 HTML block, so blank lines inside the diagram survive parsing).
+  // Mermaid expects <div class="mermaid"> with whitespace-trimmed content, so
+  // convert here right before mermaid.run().
+  document.querySelectorAll('pre.mermaid').forEach(function(pre) {
+    var div = document.createElement('div');
+    div.className = 'mermaid';
+    div.textContent = pre.textContent.replace(/^\s*\n/, '').replace(/\s+$/, '');
+    pre.replaceWith(div);
+  });
+  if (typeof mermaid === 'undefined') return;
+  mermaid.initialize({ startOnLoad: false, theme: '{THEME}', securityLevel: 'loose' });
+  mermaid.run();
+})();
 "#;
 
 // ---- Settings ---------------------------------------------------------------
@@ -190,6 +213,49 @@ fn settings_file() -> PathBuf {
 }
 
 // ---- Markdown rendering -----------------------------------------------------
+
+// Convert ```mermaid fences to <div class="mermaid">SOURCE</div> raw HTML
+// before comrak runs. Doing this at the markdown level (rather than
+// post-processing comrak's output) sidesteps the SyntectAdapter wrapping
+// unknown languages in its own markup. Returns (preprocessed text, had-any).
+fn preprocess_mermaid_blocks(text: &str) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut had_mermaid = false;
+    let mut in_block = false;
+    let mut buf = String::new();
+    for line in text.lines() {
+        if in_block {
+            if line.trim() == "```" {
+                // <pre> is a CommonMark "type 1" HTML block — terminates only
+                // on </pre>, so blank lines inside the diagram survive intact.
+                // (A <div> wrapper would terminate at the first blank line and
+                // slice multi-paragraph diagrams in half.)
+                out.push_str("\n<pre class=\"mermaid\">\n");
+                out.push_str(&html_escape(&buf));
+                out.push_str("</pre>\n\n");
+                in_block = false;
+                had_mermaid = true;
+                buf.clear();
+            } else {
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        } else if line.trim() == "```mermaid" {
+            in_block = true;
+            buf.clear();
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    // Unclosed fence: restore the original lines verbatim so we don't drop content.
+    if in_block {
+        out.push_str("```mermaid\n");
+        out.push_str(&buf);
+    }
+    (out, had_mermaid)
+}
+
 fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -229,7 +295,22 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
     let mut plugins = ComrakPlugins::default();
     plugins.render.codefence_syntax_highlighter = Some(&adapter);
 
-    let body = markdown_to_html_with_plugins(text, &options, &plugins);
+    let (preprocessed, had_mermaid) = preprocess_mermaid_blocks(text);
+    let body = markdown_to_html_with_plugins(&preprocessed, &options, &plugins);
+
+    let mermaid_script = if had_mermaid {
+        let theme = if dark { "dark" } else { "default" };
+        let init = MERMAID_INIT_JS.replace("{THEME}", theme);
+        let mut s = String::with_capacity(MERMAID_BUNDLE.len() + init.len() + 40);
+        s.push_str("<script>");
+        s.push_str(MERMAID_BUNDLE);
+        s.push_str("</script>\n<script>");
+        s.push_str(&init);
+        s.push_str("</script>");
+        s
+    } else {
+        String::new()
+    };
 
     let base_href = match base_dir {
         Some(dir) => {
@@ -255,6 +336,7 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
         .replace("{BASE_CSS}", PREVIEW_CSS_BASE)
         .replace("{BASE_HREF}", &base_href)
         .replace("{BODY}", &body)
+        .replace("{MERMAID_SCRIPT}", &mermaid_script)
 }
 
 // ---- App state --------------------------------------------------------------
