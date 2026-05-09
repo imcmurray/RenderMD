@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Tiny launcher so the .desktop file's Exec=rendermd works no matter where
+# the script lives. Symlink/copy this into ~/.local/bin or /usr/local/bin.
+# Looks for the Rust binary at:
+#   1. <script-dir>/target/release/rendermd  (in-place dev build)
+#   2. <script-dir>/rendermd-bin             (when installed alongside)
+DIR="$(dirname "$(readlink -f "$0")")"
+for candidate in "$DIR/target/release/rendermd" "$DIR/rendermd-bin"; do
+    if [[ -x "$candidate" ]]; then
+        exec "$candidate" "$@"
+    fi
+done
+echo "rendermd: binary not found. Run ./setup.sh in $DIR" >&2
+exit 1

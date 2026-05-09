@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=RenderMD
+GenericName=Markdown Viewer
+Comment=View and edit Markdown files with a beautiful native preview
+Exec=rendermd %F
+Icon=io.github.rendermd.RenderMD
+Terminal=false
+Categories=Office;Utility;TextEditor;GTK;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;md;viewer;editor;render;preview;
+StartupNotify=true
+StartupWMClass=io.github.rendermd.RenderMD
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Document
+Exec=rendermd
