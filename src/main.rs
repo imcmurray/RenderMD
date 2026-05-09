@@ -1005,8 +1005,8 @@ fn line_diff_ops<'a>(old_lines: &'a [&'a str], new_lines: &'a [&'a str]) -> Vec<
         let found = old_lines[i..].iter().position(|l| l == new_line);
         match found {
             Some(rel) => {
-                for j in i..i + rel {
-                    ops.push(LineOp::Delete(old_lines[j]));
+                for line in old_lines.iter().skip(i).take(rel) {
+                    ops.push(LineOp::Delete(line));
                 }
                 ops.push(LineOp::Equal(new_line));
                 i += rel + 1;
@@ -1014,8 +1014,8 @@ fn line_diff_ops<'a>(old_lines: &'a [&'a str], new_lines: &'a [&'a str]) -> Vec<
             None => ops.push(LineOp::Add(new_line)),
         }
     }
-    for j in i..old_lines.len() {
-        ops.push(LineOp::Delete(old_lines[j]));
+    for line in old_lines.iter().skip(i) {
+        ops.push(LineOp::Delete(line));
     }
     ops
 }
@@ -1110,8 +1110,8 @@ fn build_annotated_word_diff_md(old: &str, new: &str) -> String {
         let found = old_tokens[i..].iter().position(|t| t == new_t);
         match found {
             Some(rel) => {
-                for j in i..i + rel {
-                    push_del(&mut out, old_tokens[j]);
+                for tok in old_tokens.iter().skip(i).take(rel) {
+                    push_del(&mut out, tok);
                 }
                 for a in pending_adds.drain(..) {
                     push_ins(&mut out, a);
@@ -1122,8 +1122,8 @@ fn build_annotated_word_diff_md(old: &str, new: &str) -> String {
             None => pending_adds.push(new_t),
         }
     }
-    for j in i..old_tokens.len() {
-        push_del(&mut out, old_tokens[j]);
+    for tok in old_tokens.iter().skip(i) {
+        push_del(&mut out, tok);
     }
     for a in pending_adds.drain(..) {
         push_ins(&mut out, a);
