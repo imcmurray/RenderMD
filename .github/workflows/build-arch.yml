@@ -1,0 +1,78 @@
+name: Build pacman (Arch)
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            base-devel \
+            git \
+            rust \
+            gtk4 \
+            libadwaita \
+            webkitgtk-6.0 \
+            gtksourceview5
+
+      - uses: actions/checkout@v4
+
+      # makepkg refuses to run as root, so build as an unprivileged user.
+      - name: Set up build user
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+
+      - name: Generate PKGBUILD
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > PKGBUILD <<EOF
+          # Maintainer: imcmurray
+          pkgname=rendermd
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="A native GTK4 Markdown viewer/editor"
+          arch=('x86_64')
+          url="https://github.com/imcmurray/RenderMD"
+          license=('MIT')
+          depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'gtksourceview5')
+          makedepends=('rust' 'cargo')
+          options=('!debug' '!lto')
+          source=()
+
+          build() {
+              cd "\$startdir"
+              cargo build --release --locked
+          }
+
+          package() {
+              cd "\$startdir"
+              install -Dm755 target/release/rendermd "\$pkgdir/usr/bin/rendermd"
+              install -Dm644 io.github.rendermd.RenderMD.desktop \\
+                  "\$pkgdir/usr/share/applications/io.github.rendermd.RenderMD.desktop"
+              install -Dm644 data/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg \\
+                  "\$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg"
+              install -Dm644 README.md "\$pkgdir/usr/share/doc/rendermd/README.md"
+          }
+          EOF
+          chown builder:builder PKGBUILD
+
+      - name: Build with makepkg
+        run: sudo -u builder makepkg --noconfirm -f
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.pkg.tar.zst'
+          draft: true
+          fail_on_unmatched_files: true
+          generate_release_notes: true

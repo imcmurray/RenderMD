@@ -1,0 +1,51 @@
+name: Build .rpm (Fedora)
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: fedora:42
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc \
+            make \
+            git \
+            tar \
+            rust \
+            cargo \
+            gtk4-devel \
+            libadwaita-devel \
+            webkitgtk6.0-devel \
+            gtksourceview5-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Sync Cargo.toml version with tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build .rpm
+        run: cargo generate-rpm
+
+      - name: Upload to draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/generate-rpm/*.rpm
+          draft: true
+          fail_on_unmatched_files: true
+          generate_release_notes: true

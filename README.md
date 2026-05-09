@@ -16,6 +16,13 @@
   <img src="https://img.shields.io/badge/Rust-2021-orange" alt="Rust">
 </p>
 
+<p align="center">
+  <a href="https://github.com/imcmurray/RenderMD/actions/workflows/build-deb.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/build-deb.yml/badge.svg" alt="Build .deb (Ubuntu)"></a>
+  <a href="https://github.com/imcmurray/RenderMD/actions/workflows/build-rpm.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/build-rpm.yml/badge.svg" alt="Build .rpm (Fedora)"></a>
+  <a href="https://github.com/imcmurray/RenderMD/actions/workflows/build-arch.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/build-arch.yml/badge.svg" alt="Build pacman (Arch)"></a>
+  <a href="https://github.com/imcmurray/RenderMD/actions/workflows/build-tarball.yml"><img src="https://github.com/imcmurray/RenderMD/actions/workflows/build-tarball.yml/badge.svg" alt="Build tarball (generic)"></a>
+</p>
+
 Opens `.md` files in a rendered preview by default, toggles to a
 syntax-highlighted editor with one keystroke. Single-file Rust app — no
 Electron, no node, no compile-step beyond `cargo build`.
