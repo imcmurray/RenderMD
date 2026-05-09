@@ -611,6 +611,11 @@ impl State {
         file_section.append(Some("Save As\u{2026}"), Some("win.save-as"));
         menu.append_section(Some("File"), &file_section);
 
+        let export_section = gio::Menu::new();
+        export_section.append(Some("Export as HTML\u{2026}"), Some("win.export-html"));
+        export_section.append(Some("Export as PDF\u{2026}"), Some("win.export-pdf"));
+        menu.append_section(Some("Export"), &export_section);
+
         let edit_section = gio::Menu::new();
         edit_section.append(Some("Undo"), Some("win.undo"));
         edit_section.append(Some("Redo"), Some("win.redo"));
@@ -652,6 +657,16 @@ impl State {
                 "save-as",
                 Box::new(|st: &State| st.action_save_as()),
                 &["<Primary><Shift>s"],
+            ),
+            (
+                "export-html",
+                Box::new(|st: &State| st.action_export_html()),
+                &[],
+            ),
+            (
+                "export-pdf",
+                Box::new(|st: &State| st.action_export_pdf()),
+                &[],
             ),
             (
                 "toggle",
@@ -929,6 +944,185 @@ impl State {
                 }
             },
         );
+    }
+
+    // -- Export ----------------------------------------------------------
+    fn action_export_html(&self) {
+        let dialog = gtk::FileDialog::builder().title("Export as HTML").build();
+        dialog.set_initial_name(Some(&self.export_default_name("html")));
+        if let Some(folder) = self.export_initial_folder() {
+            dialog.set_initial_folder(Some(&folder));
+        }
+
+        let html_filter = gtk::FileFilter::new();
+        html_filter.set_name(Some("HTML"));
+        html_filter.add_pattern("*.html");
+        html_filter.add_pattern("*.htm");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&html_filter);
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&html_filter));
+
+        let st = self.clone();
+        dialog.save(
+            Some(&self.inner.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                if let Ok(file) = result {
+                    if let Some(mut path) = file.path() {
+                        if path.extension().is_none() {
+                            path.set_extension("html");
+                        }
+                        st.do_export_html(&path);
+                    }
+                }
+            },
+        );
+    }
+
+    fn do_export_html(&self, path: &Path) {
+        let text = self.buffer_text();
+        let current = self.inner.current_file.borrow().clone();
+        let base_dir = current
+            .as_ref()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let title = current
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| APP_NAME.to_string());
+        let html = render_markdown_to_html(&text, base_dir.as_deref(), self.is_dark(), &title);
+
+        // Atomic write: tmp + rename, mirroring write_to.
+        let mut tmp = path.to_path_buf();
+        let tmp_name = match path.file_name() {
+            Some(n) => {
+                let mut s = n.to_os_string();
+                s.push(".tmp");
+                s
+            }
+            None => {
+                self.error_dialog("Could not export HTML", "Invalid path");
+                return;
+            }
+        };
+        tmp.set_file_name(tmp_name);
+        if let Err(e) = fs::write(&tmp, html.as_bytes()) {
+            self.error_dialog("Could not export HTML", &e.to_string());
+            return;
+        }
+        if let Err(e) = fs::rename(&tmp, path) {
+            self.error_dialog("Could not export HTML", &e.to_string());
+            return;
+        }
+        self.show_toast(&format!("HTML exported to {}", path.display()));
+    }
+
+    fn action_export_pdf(&self) {
+        let dialog = gtk::FileDialog::builder().title("Export as PDF").build();
+        dialog.set_initial_name(Some(&self.export_default_name("pdf")));
+        if let Some(folder) = self.export_initial_folder() {
+            dialog.set_initial_folder(Some(&folder));
+        }
+
+        let pdf_filter = gtk::FileFilter::new();
+        pdf_filter.set_name(Some("PDF"));
+        pdf_filter.add_pattern("*.pdf");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&pdf_filter);
+        dialog.set_filters(Some(&filters));
+        dialog.set_default_filter(Some(&pdf_filter));
+
+        let st = self.clone();
+        dialog.save(
+            Some(&self.inner.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                if let Ok(file) = result {
+                    if let Some(mut path) = file.path() {
+                        if path.extension().is_none() {
+                            path.set_extension("pdf");
+                        }
+                        st.do_export_pdf(&path);
+                    }
+                }
+            },
+        );
+    }
+
+    fn do_export_pdf(&self, path: &Path) {
+        // PrintOperation snapshots the current WebView content. If the user
+        // is in edit mode (or has typed since the last preview), force a
+        // re-render and run the print only after load_changed=Finished, so
+        // the PDF reflects the current buffer.
+        let st = self.clone();
+        let path = path.to_path_buf();
+
+        let handler_id: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
+        let handler_id_for_closure = handler_id.clone();
+
+        let id = self.inner.webview.connect_load_changed(move |wv, event| {
+            if event != webkit6::LoadEvent::Finished {
+                return;
+            }
+            if let Some(id) = handler_id_for_closure.borrow_mut().take() {
+                wv.disconnect(id);
+            }
+            st.run_pdf_print(&path);
+        });
+        *handler_id.borrow_mut() = Some(id);
+
+        self.refresh_preview();
+    }
+
+    fn run_pdf_print(&self, path: &Path) {
+        let op = webkit6::PrintOperation::new(&self.inner.webview);
+
+        let settings = gtk::PrintSettings::new();
+        // The "Print to File" virtual printer is part of GTK's print backend
+        // and writes whatever the configured output-uri points at.
+        settings.set_printer("Print to File");
+        let path_str = path.to_string_lossy();
+        let escaped = glib::Uri::escape_string(&path_str, Some("/"), false).to_string();
+        settings.set("output-uri", Some(&format!("file://{}", escaped)));
+        op.set_print_settings(&settings);
+
+        let setup = gtk::PageSetup::new();
+        setup.set_paper_size(&gtk::PaperSize::new(Some("iso_a4")));
+        op.set_page_setup(&setup);
+
+        let st = self.clone();
+        let done_path = path.to_path_buf();
+        op.connect_finished(move |_| {
+            st.show_toast(&format!("PDF exported to {}", done_path.display()));
+        });
+
+        let st = self.clone();
+        op.connect_failed(move |_, err| {
+            st.error_dialog("Could not export PDF", &err.to_string());
+        });
+
+        op.print();
+    }
+
+    fn export_default_name(&self, ext: &str) -> String {
+        let stem = self
+            .inner
+            .current_file
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+        format!("{}.{}", stem, ext)
+    }
+
+    fn export_initial_folder(&self) -> Option<gio::File> {
+        self.inner
+            .current_file
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.parent().map(gio::File::for_path))
     }
 
     fn write_to(&self, path: &Path) {
