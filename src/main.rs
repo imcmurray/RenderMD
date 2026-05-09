@@ -1325,7 +1325,8 @@ impl State {
             },
         };
         self.load_text(&text, Some(path.to_path_buf()));
-        self.set_mode(MODE_PREVIEW, false);
+        // force=true so re-opening into an already-active preview still re-renders.
+        self.set_mode(MODE_PREVIEW, true);
     }
 
     fn action_save(&self) {
