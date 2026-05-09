@@ -3,11 +3,12 @@
 // F5 / Ctrl+Shift+E. Single-file Rust port of the original Python prototype.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use adw::prelude::*;
 use comrak::plugins::syntect::SyntectAdapter;
@@ -43,6 +44,7 @@ const PREVIEW_CSS_LIGHT: &str = r#"
   --alert-important: #8250df;
   --alert-warning: #9a6700;
   --alert-caution: #cf222e;
+  --change: #d4a017;
 }
 "#;
 
@@ -64,6 +66,7 @@ const PREVIEW_CSS_DARK: &str = r#"
   --alert-important: #a371f7;
   --alert-warning: #d29922;
   --alert-caution: #f85149;
+  --change: #e3b341;
 }
 "#;
 
@@ -202,6 +205,67 @@ img {
 .alert-warning .alert-title { color: var(--alert-warning); }
 .alert-caution { border-color: var(--alert-caution); }
 .alert-caution .alert-title { color: var(--alert-caution); }
+.rmd-changed-marker { display: block; height: 0; margin: 0; padding: 0; }
+.rmd-changed-marker + * {
+  border-left: 3px solid var(--change);
+  padding-left: 0.75em;
+  margin-left: -1em;
+  cursor: default;
+}
+.rmd-changed-marker + .rmd-showing-prev {
+  background: rgba(227, 179, 65, 0.06);
+}
+.rmd-prev-empty { color: var(--muted); }
+.rmd-prev-banner {
+  font-size: 0.68em;
+  font-weight: 500;
+  font-style: italic;
+  color: var(--muted);
+  margin: 0.5em 0 0 0;
+  padding-top: 0.25em;
+  border-top: 1px solid var(--border);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.rmd-diff {
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Mono",
+               "DejaVu Sans Mono", ui-monospace, monospace;
+  font-size: 0.92em;
+  line-height: 1.5;
+  margin: 0.25em 0;
+}
+.rmd-diff-line {
+  display: flex;
+  white-space: pre-wrap;
+  padding: 0 0.25em;
+  border-radius: 2px;
+}
+.rmd-diff-mark {
+  flex: 0 0 1.4em;
+  text-align: center;
+  font-weight: 600;
+  user-select: none;
+  opacity: 0.85;
+}
+.rmd-diff-text { flex: 1 1 auto; }
+.rmd-diff-add { background: rgba(31, 136, 61, 0.14); color: var(--alert-tip); }
+.rmd-diff-del { background: rgba(207, 34, 46, 0.14); color: var(--alert-caution); }
+.rmd-diff-mod { background: rgba(227, 179, 65, 0.08); }
+.rmd-diff-eq  { color: var(--muted); }
+.rmd-diff-w-del {
+  background: rgba(207, 34, 46, 0.22);
+  color: var(--alert-caution);
+  text-decoration: line-through;
+  border-radius: 2px;
+  padding: 0 2px;
+}
+.rmd-diff-w-add {
+  background: rgba(31, 136, 61, 0.22);
+  color: var(--alert-tip);
+  text-decoration: none;
+  border-radius: 2px;
+  padding: 0 2px;
+}
 "#;
 
 const HTML_TEMPLATE: &str = r#"<!doctype html>
@@ -689,6 +753,21 @@ fn preprocess_mermaid_blocks(text: &str) -> (String, bool) {
     (out, had_mermaid)
 }
 
+fn format_mtime(path: &Path) -> String {
+    let modified = match fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return String::new(),
+    };
+    let secs = match modified.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return String::new(),
+    };
+    match glib::DateTime::from_unix_local(secs).and_then(|dt| dt.format("%Y-%m-%d %H:%M")) {
+        Ok(s) => format!("Updated {}", s),
+        Err(_) => String::new(),
+    }
+}
+
 fn html_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -702,6 +781,448 @@ fn html_escape(input: &str) -> String {
         }
     }
     out
+}
+
+// Multiset line-subtraction diff: lines that appear more often in `new` than
+// in `old` are flagged as changed. Imprecise around duplicate lines but
+// adequate for prose change-marking and avoids pulling in a diff crate.
+// Returned indices are 1-based against `new`.
+fn compute_changed_lines(old: &str, new: &str) -> HashSet<usize> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for line in old.lines() {
+        *counts.entry(line).or_default() += 1;
+    }
+    let mut changed = HashSet::new();
+    for (i, line) in new.lines().enumerate() {
+        match counts.get_mut(line) {
+            Some(c) if *c > 0 => *c -= 1,
+            _ => {
+                changed.insert(i + 1);
+            }
+        }
+    }
+    changed
+}
+
+// Approximate top-level Markdown block detection: split on blank lines, but
+// keep fenced code blocks (``` or ~~~) together. Good enough for marking
+// changed regions in prose; a list with internal blank lines will be split
+// per-item, which is finer-grained than the AST but still informative.
+fn split_top_level_blocks(text: &str) -> Vec<(usize, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks = Vec::new();
+    let mut block_start: Option<usize> = None;
+    let mut in_fence = false;
+    let mut fence_marker: &str = "";
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if in_fence {
+            if trimmed.starts_with(fence_marker) {
+                in_fence = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if block_start.is_none() {
+                block_start = Some(idx + 1);
+            }
+            in_fence = true;
+            fence_marker = if trimmed.starts_with("```") {
+                "```"
+            } else {
+                "~~~"
+            };
+        } else if line.trim().is_empty() {
+            if let Some(start) = block_start.take() {
+                blocks.push((start, idx));
+            }
+        } else if block_start.is_none() {
+            block_start = Some(idx + 1);
+        }
+    }
+    if let Some(start) = block_start.take() {
+        blocks.push((start, lines.len()));
+    }
+    blocks
+}
+
+struct PendingChanges {
+    changed_lines: HashSet<usize>,
+    old_text: String,
+    reload_ts: i64,
+}
+
+// Insert a `<div class="rmd-changed-marker">` HTML block before each
+// top-level block whose line range overlaps `changes.changed_lines`. The
+// CSS sibling selector then puts a left border on the next rendered
+// element. Each marker also carries the corresponding *old* block text and
+// the reload timestamp, which the bundled JS uses to populate a tooltip on
+// hover.
+fn inject_change_markers(text: &str, changes: &PendingChanges, dark: bool) -> String {
+    if changes.changed_lines.is_empty() {
+        return text.to_string();
+    }
+    let new_blocks = split_top_level_blocks(text);
+    let new_lines: Vec<&str> = text.lines().collect();
+    let old_lines: Vec<&str> = changes.old_text.lines().collect();
+
+    let mut markers: HashMap<usize, String> = HashMap::new();
+    for (start, end) in new_blocks {
+        if !(start..=end).any(|l| changes.changed_lines.contains(&l)) {
+            continue;
+        }
+        // Best-effort positional match: take the same 1-based line range
+        // from old_text and new_text, clamped. Imprecise after big inserts
+        // / deletes higher up, but a useful approximation.
+        let slice = |lines: &[&str]| -> String {
+            if lines.is_empty() || start > lines.len() {
+                String::new()
+            } else {
+                let lo = start - 1;
+                let hi = end.min(lines.len());
+                lines[lo..hi].join("\n")
+            }
+        };
+        let old_block = slice(&old_lines);
+        let new_block = slice(&new_lines);
+        let annotated_md = build_annotated_diff_md(&old_block, &new_block);
+        let prev_html = render_block_to_inline_html(&annotated_md, dark);
+        let escaped = glib::Uri::escape_string(&prev_html, None, false).to_string();
+        markers.insert(
+            start,
+            format!(
+                "<div class=\"rmd-changed-marker\" data-prev-html=\"{}\" data-age-ts=\"{}\"></div>\n\n",
+                escaped, changes.reload_ts
+            ),
+        );
+    }
+
+    let mut out = String::with_capacity(text.len() + markers.len() * 96);
+    for (idx, line) in new_lines.iter().enumerate() {
+        if let Some(m) = markers.get(&(idx + 1)) {
+            out.push_str(m);
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Append a one-shot script that wires native tooltips on the changed
+    // blocks. Native browser tooltip delay (~700–1000 ms) gives the
+    // "hover for a second" behaviour for free.
+    out.push('\n');
+    out.push_str(CHANGE_TOOLTIP_JS);
+    out
+}
+
+const CHANGE_TOOLTIP_JS: &str = r#"<script>
+(function() {
+  function fmtAge(s) {
+    if (s < 5) return "just now";
+    if (s < 60) return s + " seconds ago";
+    if (s < 3600) {
+      var m = Math.floor(s / 60);
+      return m + (m === 1 ? " minute ago" : " minutes ago");
+    }
+    if (s < 86400) {
+      var h = Math.floor(s / 3600);
+      return h + (h === 1 ? " hour ago" : " hours ago");
+    }
+    var d = Math.floor(s / 86400);
+    return d + (d === 1 ? " day ago" : " days ago");
+  }
+  function unwrapToInner(html, expectedTag) {
+    // Comrak wraps each block in its outer tag (e.g. <p>, <h2>, <ul>).
+    // Since the target element ALREADY is that wrapper, strip the outer
+    // tag so we don't end up with nested <p><p>... etc.
+    var tmp = document.createElement("div");
+    tmp.innerHTML = html;
+    var first = tmp.firstElementChild;
+    if (first && first.tagName === expectedTag) {
+      return first.innerHTML;
+    }
+    return html;
+  }
+  function init() {
+    document.querySelectorAll(".rmd-changed-marker").forEach(function(m) {
+      var t = m.nextElementSibling;
+      if (!t) return;
+      var ts = parseInt(m.getAttribute("data-age-ts"), 10);
+      var prevRaw = m.getAttribute("data-prev-html") || "";
+      var prevHtml = "";
+      try { prevHtml = decodeURIComponent(prevRaw); } catch (e) { prevHtml = ""; }
+      var inner = prevHtml ? unwrapToInner(prevHtml, t.tagName) : "";
+      var swapTimer = null;
+      t.addEventListener("mouseenter", function() {
+        if (t.classList.contains("rmd-showing-prev")) return;
+        if (swapTimer) clearTimeout(swapTimer);
+        swapTimer = setTimeout(function() {
+          swapTimer = null;
+          if (!("rmdOriginal" in t.dataset)) {
+            t.dataset.rmdOriginal = t.innerHTML;
+          }
+          var ageS = Math.floor(Date.now() / 1000) - ts;
+          var banner = '<div class="rmd-prev-banner">Edited externally ' + fmtAge(ageS) + '</div>';
+          var content = inner || '<em class="rmd-prev-empty">(no prior content for this block)</em>';
+          t.innerHTML = content + banner;
+          t.classList.add("rmd-showing-prev");
+        }, 1000);
+      });
+      t.addEventListener("mouseleave", function() {
+        if (swapTimer) { clearTimeout(swapTimer); swapTimer = null; }
+        if (t.classList.contains("rmd-showing-prev") && "rmdOriginal" in t.dataset) {
+          t.innerHTML = t.dataset.rmdOriginal;
+          delete t.dataset.rmdOriginal;
+          t.classList.remove("rmd-showing-prev");
+        }
+      });
+    });
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+"#;
+
+// Greedy line-level diff plus intra-line word-level diff. Adjacent
+// delete/add pairs that share enough vocabulary are rendered as a single
+// "modified" line with only the changed words highlighted, instead of
+// dumping the full old and new lines as two solid red/green blocks.
+// Plain LCS-free; good enough for typical edits.
+
+#[derive(Debug)]
+enum LineOp<'a> {
+    Equal(&'a str),
+    Delete(&'a str),
+    Add(&'a str),
+}
+
+fn line_diff_ops<'a>(old_lines: &'a [&'a str], new_lines: &'a [&'a str]) -> Vec<LineOp<'a>> {
+    let mut ops = Vec::new();
+    let mut i = 0usize;
+    for new_line in new_lines {
+        let found = old_lines[i..].iter().position(|l| l == new_line);
+        match found {
+            Some(rel) => {
+                for j in i..i + rel {
+                    ops.push(LineOp::Delete(old_lines[j]));
+                }
+                ops.push(LineOp::Equal(new_line));
+                i += rel + 1;
+            }
+            None => ops.push(LineOp::Add(new_line)),
+        }
+    }
+    for j in i..old_lines.len() {
+        ops.push(LineOp::Delete(old_lines[j]));
+    }
+    ops
+}
+
+// Tokenize as runs of alphanumerics, runs of whitespace, or single
+// non-word chars. Keeps whitespace as its own token so we don't lose
+// spacing when stitching the segments back together.
+fn tokenize_for_diff(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut iter = s.char_indices().peekable();
+    while let Some(&(start, c)) = iter.peek() {
+        if c.is_alphanumeric() {
+            iter.next();
+            let mut end = start + c.len_utf8();
+            while let Some(&(_, c2)) = iter.peek() {
+                if !c2.is_alphanumeric() {
+                    break;
+                }
+                end += c2.len_utf8();
+                iter.next();
+            }
+            out.push(&s[start..end]);
+        } else if c.is_whitespace() {
+            iter.next();
+            let mut end = start + c.len_utf8();
+            while let Some(&(_, c2)) = iter.peek() {
+                if !c2.is_whitespace() {
+                    break;
+                }
+                end += c2.len_utf8();
+                iter.next();
+            }
+            out.push(&s[start..end]);
+        } else {
+            iter.next();
+            let end = start + c.len_utf8();
+            out.push(&s[start..end]);
+        }
+    }
+    out
+}
+
+// Multiset overlap divided by the larger token count. Whitespace and empty
+// tokens don't contribute. Returns 1.0 for two empty inputs.
+fn line_similarity(a: &str, b: &str) -> f64 {
+    let keep = |t: &&str| !t.trim().is_empty();
+    let a_tokens: Vec<&str> = tokenize_for_diff(a).into_iter().filter(keep).collect();
+    let b_tokens: Vec<&str> = tokenize_for_diff(b).into_iter().filter(keep).collect();
+    let bigger = a_tokens.len().max(b_tokens.len());
+    if bigger == 0 {
+        return 1.0;
+    }
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for t in &a_tokens {
+        *counts.entry(*t).or_default() += 1;
+    }
+    let mut common = 0usize;
+    for t in &b_tokens {
+        if let Some(c) = counts.get_mut(t) {
+            if *c > 0 {
+                *c -= 1;
+                common += 1;
+            }
+        }
+    }
+    common as f64 / bigger as f64
+}
+
+// Builds an annotated *markdown* line for a modified pair: emits the new
+// text with inline <del>/<ins> tags wrapping only the changed words, so
+// after we feed it back to comrak it renders with the same typography as
+// the surrounding paragraph / heading / list item.
+fn build_annotated_word_diff_md(old: &str, new: &str) -> String {
+    let old_tokens = tokenize_for_diff(old);
+    let new_tokens = tokenize_for_diff(new);
+    let mut out = String::new();
+    let mut i = 0usize;
+    // Buffer added tokens until the next match so deletions are emitted
+    // before insertions — reads more naturally as "old → new".
+    let mut pending_adds: Vec<&str> = Vec::new();
+    let push_del = |out: &mut String, s: &str| {
+        out.push_str("<del class=\"rmd-diff-w-del\">");
+        out.push_str(s);
+        out.push_str("</del>");
+    };
+    let push_ins = |out: &mut String, s: &str| {
+        out.push_str("<ins class=\"rmd-diff-w-add\">");
+        out.push_str(s);
+        out.push_str("</ins>");
+    };
+    for new_t in &new_tokens {
+        let found = old_tokens[i..].iter().position(|t| t == new_t);
+        match found {
+            Some(rel) => {
+                for j in i..i + rel {
+                    push_del(&mut out, old_tokens[j]);
+                }
+                for a in pending_adds.drain(..) {
+                    push_ins(&mut out, a);
+                }
+                out.push_str(new_t);
+                i += rel + 1;
+            }
+            None => pending_adds.push(new_t),
+        }
+    }
+    for j in i..old_tokens.len() {
+        push_del(&mut out, old_tokens[j]);
+    }
+    for a in pending_adds.drain(..) {
+        push_ins(&mut out, a);
+    }
+    out
+}
+
+// Builds annotated markdown for a whole changed block. Equal lines pass
+// through unchanged; modified pairs become an annotated word-diff line;
+// pure adds/deletes get wrapped in <ins>/<del>. The result is plain
+// markdown source that we feed back to comrak, so the rendered hover view
+// preserves the original block's styling and just marks what changed.
+fn build_annotated_diff_md(old: &str, new: &str) -> String {
+    const MOD_THRESHOLD: f64 = 0.30;
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let ops = line_diff_ops(&old_lines, &new_lines);
+
+    let mut out = String::new();
+    let mut idx = 0usize;
+    while idx < ops.len() {
+        if let LineOp::Equal(line) = &ops[idx] {
+            out.push_str(line);
+            out.push('\n');
+            idx += 1;
+            continue;
+        }
+        let mut adds: Vec<&str> = Vec::new();
+        let mut dels: Vec<&str> = Vec::new();
+        while idx < ops.len() {
+            match &ops[idx] {
+                LineOp::Add(s) => adds.push(s),
+                LineOp::Delete(s) => dels.push(s),
+                LineOp::Equal(_) => break,
+            }
+            idx += 1;
+        }
+        let pair_count = adds.len().min(dels.len());
+        for i in 0..pair_count {
+            let old_line = dels[i];
+            let new_line = adds[i];
+            if line_similarity(old_line, new_line) >= MOD_THRESHOLD {
+                out.push_str(&build_annotated_word_diff_md(old_line, new_line));
+                out.push('\n');
+            } else {
+                out.push_str("<del class=\"rmd-diff-w-del\">");
+                out.push_str(old_line);
+                out.push_str("</del>\n");
+                out.push_str("<ins class=\"rmd-diff-w-add\">");
+                out.push_str(new_line);
+                out.push_str("</ins>\n");
+            }
+        }
+        for line in dels.iter().skip(pair_count) {
+            out.push_str("<del class=\"rmd-diff-w-del\">");
+            out.push_str(line);
+            out.push_str("</del>\n");
+        }
+        for line in adds.iter().skip(pair_count) {
+            out.push_str("<ins class=\"rmd-diff-w-add\">");
+            out.push_str(line);
+            out.push_str("</ins>\n");
+        }
+    }
+    out
+}
+
+// Renders a markdown snippet to inline body HTML using the same comrak
+// pipeline as the full-document renderer. Used by the hover-swap so the
+// previous-version view keeps the original block's typography rather
+// than dropping into a monospace diff view.
+fn render_block_to_inline_html(text: &str, dark: bool) -> String {
+    let mut options = ComrakOptions::default();
+    options.extension.strikethrough = true;
+    options.extension.tagfilter = false;
+    options.extension.table = true;
+    options.extension.autolink = true;
+    options.extension.tasklist = true;
+    options.extension.superscript = true;
+    options.extension.footnotes = true;
+    options.extension.description_lists = true;
+    options.extension.header_ids = Some(String::new());
+    options.parse.smart = true;
+    options.render.unsafe_ = true;
+    options.render.github_pre_lang = true;
+
+    let theme = if dark {
+        "base16-ocean.dark"
+    } else {
+        "InspiredGitHub"
+    };
+    let adapter = SyntectAdapter::new(Some(theme));
+    let mut plugins = ComrakPlugins::default();
+    plugins.render.codefence_syntax_highlighter = Some(&adapter);
+
+    let with_emoji = preprocess_emoji(text);
+    let with_alerts = preprocess_alerts(&with_emoji);
+    let (preprocessed, _) = preprocess_mermaid_blocks(&with_alerts);
+    markdown_to_html_with_plugins(&preprocessed, &options, &plugins)
 }
 
 fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, title: &str) -> String {
@@ -793,12 +1314,18 @@ struct StateInner {
     toggle_icon: gtk::Image,
     toggle_label: gtk::Label,
     status_path: gtk::Label,
+    status_mtime: gtk::Label,
     status_mode: gtk::Label,
 
     current_file: RefCell<Option<PathBuf>>,
     is_modified: Cell<bool>,
     mode: RefCell<String>,
     suppress_modify: Cell<bool>,
+    // One-shot: set by reload_from_disk, taken by the next refresh_preview
+    // to mark changed blocks with a left-border + hover tooltip showing
+    // the prior content and how long ago the edit happened. Cleared on any
+    // open/new so stale change marks can't leak across files.
+    pending_changes: RefCell<Option<PendingChanges>>,
     toggle_handler: RefCell<Option<glib::SignalHandlerId>>,
     buffer_handler: RefCell<Option<glib::SignalHandlerId>>,
 
@@ -834,6 +1361,7 @@ impl State {
         let toggle_icon = gtk::Image::from_icon_name("document-edit-symbolic");
         let toggle_label = gtk::Label::new(Some("Edit"));
         let status_path = gtk::Label::new(None);
+        let status_mtime = gtk::Label::new(None);
         let status_mode = gtk::Label::new(None);
 
         let inner = StateInner {
@@ -847,11 +1375,13 @@ impl State {
             toggle_icon,
             toggle_label,
             status_path,
+            status_mtime,
             status_mode,
             current_file: RefCell::new(None),
             is_modified: Cell::new(false),
             mode: RefCell::new(MODE_PREVIEW.to_string()),
             suppress_modify: Cell::new(false),
+            pending_changes: RefCell::new(None),
             toggle_handler: RefCell::new(None),
             buffer_handler: RefCell::new(None),
             watcher: RefCell::new(None),
@@ -1012,8 +1542,10 @@ impl State {
         s.status_path.set_hexpand(true);
         s.status_path.set_ellipsize(pango::EllipsizeMode::Middle);
         s.status_path.add_css_class("dim-label");
+        s.status_mtime.add_css_class("dim-label");
         s.status_mode.add_css_class("dim-label");
         status_bar.append(&s.status_path);
+        status_bar.append(&s.status_mtime);
         status_bar.append(&s.status_mode);
         toolbar_view.add_bottom_bar(&status_bar);
 
@@ -1219,7 +1751,10 @@ impl State {
     // -- Preview ---------------------------------------------------------
     fn refresh_preview(&self) {
         let s = &self.inner;
-        let text = self.buffer_text();
+        let mut text = self.buffer_text();
+        if let Some(changes) = s.pending_changes.borrow_mut().take() {
+            text = inject_change_markers(&text, &changes, self.is_dark());
+        }
         let current = s.current_file.borrow().clone();
         let base_dir: PathBuf = current
             .as_ref()
@@ -1599,6 +2134,10 @@ impl State {
         self.inner.buffer.set_text(text);
         self.inner.suppress_modify.set(false);
         *self.inner.current_file.borrow_mut() = path.clone();
+        // Drop any stale change-markers from a prior reload — they belong to
+        // a different file or a stale baseline. reload_from_disk re-sets this
+        // *after* calling load_text.
+        *self.inner.pending_changes.borrow_mut() = None;
         self.mark_clean();
         self.update_title();
         self.update_watch(path.as_deref());
@@ -1691,10 +2230,11 @@ impl State {
             return;
         }
         self.reload_from_disk(&path);
+        self.show_toast("Reloaded — file changed on disk");
     }
 
     fn reload_from_disk(&self, path: &Path) {
-        let text = match fs::read_to_string(path) {
+        let new_text = match fs::read_to_string(path) {
             Ok(t) => t,
             Err(_) => match fs::read(path) {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -1704,15 +2244,73 @@ impl State {
                 }
             },
         };
-        self.load_text(&text, Some(path.to_path_buf()));
+        let old_text = self.buffer_text();
+        self.load_text(&new_text, Some(path.to_path_buf()));
+        let changed = compute_changed_lines(&old_text, &new_text);
+        if !changed.is_empty() {
+            let reload_ts = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            *self.inner.pending_changes.borrow_mut() = Some(PendingChanges {
+                changed_lines: changed,
+                old_text,
+                reload_ts,
+            });
+        }
         if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
             self.refresh_preview();
         }
     }
 
     fn show_toast(&self, message: &str) {
-        let toast = adw::Toast::new(message);
-        toast.set_timeout(4);
+        const TIMEOUT_SECS: u32 = 6;
+        let toast = adw::Toast::new("");
+        toast.set_timeout(TIMEOUT_SECS);
+
+        // Custom title: vertical box with the message and a thin progress
+        // bar that fills left→right as the timer runs out. Adwaita already
+        // shows its own dismiss "X" on the toast, so we don't add another
+        // button here (otherwise the user sees two close icons).
+        let vbox = gtk::Box::new(gtk::Orientation::Vertical, 6);
+
+        let label = gtk::Label::new(Some(message));
+        label.set_wrap(true);
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        vbox.append(&label);
+
+        let progress = gtk::ProgressBar::new();
+        progress.set_fraction(0.0);
+        progress.set_hexpand(true);
+        progress.add_css_class("rmd-toast-progress");
+        vbox.append(&progress);
+
+        toast.set_custom_title(Some(&vbox));
+
+        // Animate the progress bar from empty → full over the timeout.
+        // Stops when the toast has been dismissed (weak-ref upgrade fails).
+        let total_ms = u64::from(TIMEOUT_SECS) * 1000;
+        let tick_ms: u64 = 50;
+        let steps = (total_ms / tick_ms) as f64;
+        let inc = 1.0 / steps;
+        let progress_clone = progress.clone();
+        let toast_weak = toast.downgrade();
+        let current = Rc::new(Cell::new(0.0_f64));
+        glib::timeout_add_local(Duration::from_millis(tick_ms), move || {
+            if toast_weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            let next = current.get() + inc;
+            if next >= 1.0 {
+                progress_clone.set_fraction(1.0);
+                return glib::ControlFlow::Break;
+            }
+            current.set(next);
+            progress_clone.set_fraction(next);
+            glib::ControlFlow::Continue
+        });
+
         self.inner.toast_overlay.add_toast(toast);
     }
 
@@ -1765,8 +2363,14 @@ impl State {
             .window
             .set_title(Some(&format!("{}{} \u{2014} {}", prefix, name, APP_NAME)));
         match current {
-            Some(p) => self.inner.status_path.set_text(&p.to_string_lossy()),
-            None => self.inner.status_path.set_text("(unsaved document)"),
+            Some(p) => {
+                self.inner.status_path.set_text(&p.to_string_lossy());
+                self.inner.status_mtime.set_text(&format_mtime(&p));
+            }
+            None => {
+                self.inner.status_path.set_text("(unsaved document)");
+                self.inner.status_mtime.set_text("");
+            }
         }
     }
 
@@ -1969,6 +2573,40 @@ impl State {
 // to live in a directory the GTK icon theme searches. Try a few candidate
 // locations so this works whether you ran `cargo run`, `./rendermd` from the
 // project root, or installed the binary somewhere else.
+// App-level CSS overrides: bumps toast contrast (the default Adwaita toast
+// can look washed-out over a busy WebView background) and tightens the
+// embedded progress bar we use for the auto-dismiss countdown.
+const APP_CSS: &str = r#"
+toast {
+  background-color: rgba(28, 28, 32, 0.96);
+  color: #ffffff;
+}
+toast button {
+  color: #ffffff;
+}
+.rmd-toast-progress trough,
+.rmd-toast-progress progress {
+  min-height: 3px;
+  border-radius: 1.5px;
+}
+.rmd-toast-progress progress {
+  background-color: #e3b341;
+}
+"#;
+
+fn register_app_css() {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(APP_CSS);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn register_icon_search_paths() {
     let Some(display) = gdk::Display::default() else {
         return;
@@ -2070,7 +2708,10 @@ fn main() -> glib::ExitCode {
         .flags(gio::ApplicationFlags::HANDLES_OPEN)
         .build();
 
-    app.connect_startup(|_| register_icon_search_paths());
+    app.connect_startup(|_| {
+        register_icon_search_paths();
+        register_app_css();
+    });
 
     app.connect_activate(|app| {
         let state = ensure_state(app);
