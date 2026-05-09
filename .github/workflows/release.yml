@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    name: Build .deb (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libgtksourceview-5-dev \
+            pkg-config \
+            build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Sync Cargo.toml version with tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb
+        run: cargo deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: target/debian/*.deb
+
+  build-rpm:
+    name: Build .rpm (Fedora 40)
+    runs-on: ubuntu-24.04
+    container: fedora:40
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            gcc \
+            make \
+            git \
+            tar \
+            rust \
+            cargo \
+            gtk4-devel \
+            libadwaita-devel \
+            webkitgtk6.0-devel \
+            gtksourceview5-devel
+
+      - uses: actions/checkout@v4
+
+      - name: Sync Cargo.toml version with tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build .rpm
+        run: cargo generate-rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: target/generate-rpm/*.rpm
+
+  build-arch:
+    name: Build pacman package (Arch)
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            base-devel \
+            git \
+            rust \
+            gtk4 \
+            libadwaita \
+            webkitgtk-6.0 \
+            gtksourceview5
+
+      - uses: actions/checkout@v4
+
+      # makepkg refuses to run as root, so build as an unprivileged user.
+      - name: Set up build user
+        run: |
+          useradd -m builder
+          chown -R builder:builder .
+
+      - name: Generate PKGBUILD
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > PKGBUILD <<EOF
+          # Maintainer: imcmurray
+          pkgname=rendermd
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="A native GTK4 Markdown viewer/editor"
+          arch=('x86_64')
+          url="https://github.com/imcmurray/RenderMD"
+          license=('MIT')
+          depends=('gtk4' 'libadwaita' 'webkitgtk-6.0' 'gtksourceview5')
+          makedepends=('rust' 'cargo')
+          options=('!debug' '!lto')
+          source=()
+
+          build() {
+              cd "\$startdir"
+              cargo build --release --frozen
+          }
+
+          package() {
+              cd "\$startdir"
+              install -Dm755 target/release/rendermd "\$pkgdir/usr/bin/rendermd"
+              install -Dm644 io.github.rendermd.RenderMD.desktop \\
+                  "\$pkgdir/usr/share/applications/io.github.rendermd.RenderMD.desktop"
+              install -Dm644 data/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg \\
+                  "\$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg"
+              install -Dm644 README.md "\$pkgdir/usr/share/doc/rendermd/README.md"
+          }
+          EOF
+          chown builder:builder PKGBUILD
+
+      - name: Build with makepkg
+        run: sudo -u builder makepkg --noconfirm -f
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: '*.pkg.tar.zst'
+
+  build-tarball:
+    name: Build generic tarball
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev \
+            libadwaita-1-dev \
+            libwebkitgtk-6.0-dev \
+            libgtksourceview-5-dev \
+            pkg-config \
+            build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage tarball contents
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGE="rendermd-${VERSION}-linux-x86_64"
+          mkdir -p "$STAGE/target/release"
+          cp target/release/rendermd "$STAGE/target/release/"
+          cp -r data "$STAGE/"
+          cp io.github.rendermd.RenderMD.desktop rendermd setup.sh README.md "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: '*.tar.gz'
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-deb, build-rpm, build-arch, build-tarball]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/deb/*.deb
+            artifacts/rpm/*.rpm
+            artifacts/arch/*.pkg.tar.zst
+            artifacts/tarball/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true

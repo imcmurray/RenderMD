@@ -21,3 +21,34 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[package.metadata.deb]
+section = "utils"
+priority = "optional"
+depends = "$auto, libgtk-4-1, libadwaita-1-0, libwebkitgtk-6.0-4, libgtksourceview-5-0"
+extended-description = """\
+RenderMD is a native GTK4 + libadwaita Markdown viewer and editor. \
+Opens .md files in a rendered preview by default; toggle to a \
+syntax-highlighted editor with F5 or Ctrl+Shift+E. Markdown rendering \
+uses comrak (GFM) with syntect-based code highlighting; the preview is \
+a webkit6 WebView."""
+assets = [
+    ["target/release/rendermd", "usr/bin/", "755"],
+    ["io.github.rendermd.RenderMD.desktop", "usr/share/applications/", "644"],
+    ["data/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["README.md", "usr/share/doc/rendermd/README", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/rendermd", dest = "/usr/bin/rendermd", mode = "755" },
+    { source = "io.github.rendermd.RenderMD.desktop", dest = "/usr/share/applications/io.github.rendermd.RenderMD.desktop", mode = "644" },
+    { source = "data/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/rendermd/README", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+gtk4 = "*"
+libadwaita = "*"
+"webkitgtk6.0" = "*"
+gtksourceview5 = "*"
