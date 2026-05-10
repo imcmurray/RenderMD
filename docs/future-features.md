@@ -114,6 +114,36 @@ parentheses flag what's already partially wired in `src/main.rs`.
   rendering features (alerts, mermaid, code blocks, etc.) — opens once on
   first launch and is reachable from the menu.
 
+## Git history walker
+
+- [ ] **Vertical commit timeline on the left of the preview.** When the
+  open `.md` lives in a git repo and has any commit history, draw a thin
+  track down the left edge of the preview with one circle per commit
+  affecting this file. Newest at the top, oldest at the bottom (or the
+  other way — pick what reads best).
+  - Hover a circle: tooltip with the commit date/time, short SHA, and
+    subject line.
+  - Click a circle: preview jumps to the file at that revision. The
+    existing change-marker + hover-diff pipeline lights up to show what
+    that commit changed relative to its parent.
+  - Toggle on/off from the menu (View → Show history). Persisted in
+    `settings.ini`.
+  - **When toggled off but history is available**: a subtle, easily
+    ignored hint — e.g. a single small dot in the status bar or a thin
+    pip on the preview's left margin — so the user knows the option
+    exists without it intruding on plain reading.
+  - **When the file isn't in a git repo**: no UI at all, no errors.
+  - Source: `git log --pretty=%H%x09%cI%x09%s -- file.md` for the timeline,
+    `git show <sha>:relpath` to fetch the blob at that revision.
+  - Implementation sketch: render the track inside the preview WebView
+    (a position:fixed sidebar of `<div>` circles) and use a webkit user
+    message handler to send the clicked SHA back to Rust, which calls
+    `git show` and feeds the result through the existing reload path.
+  - Keep scope tight — *not* a full history browser. No graph view, no
+    blame, no branch switching, no commit details panel. Just "walk what
+    this one file looked like at each point in time", which fits the
+    "watch markdown evolve" positioning we're already building toward.
+
 ## Integrations & power-user
 
 - [ ] **LSP for markdown.** Wire up `marksman` for completion, hover, go-to-def
