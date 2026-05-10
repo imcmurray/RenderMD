@@ -2,23 +2,32 @@ use std::process::Command;
 
 fn main() {
     // Embed the short git SHA at build time so the About dialog can show
-    // exactly which commit a binary was built from. Falls back to
-    // "unknown" when building from a tarball with no .git/ alongside.
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    // exactly which commit a binary was built from. Resolution order:
+    //   1. `GIT_SHA` env var (CI sets this so packaging builds don't
+    //      need .git/ inside the build tree at all).
+    //   2. `git rev-parse --short HEAD` if available.
+    //   3. literal "unknown" — used by tarball builds.
+    let sha = std::env::var("GIT_SHA")
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| String::from("unknown"));
     println!("cargo:rustc-env=GIT_SHA={sha}");
-    // Re-run only when *something we name* changes. Without at least one
-    // existing rerun-if-changed target, cargo falls back to scanning the
-    // whole package directory — which breaks tarball / makepkg builds
-    // that drop a privileged `pkg/` directory inside the source tree.
+    // Always emit at least one rerun-if-changed so cargo doesn't fall
+    // back to scanning the entire package directory — that scan trips
+    // on makepkg's privileged `pkg/` subdir during pacman builds.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=GIT_SHA");
     if std::path::Path::new(".git/HEAD").exists() {
         println!("cargo:rerun-if-changed=.git/HEAD");
     }

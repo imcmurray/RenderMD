@@ -50,18 +50,27 @@ jobs:
           source=()
 
           build() {
-              cd "\$startdir"
-              cargo build --release --locked
+              # makepkg creates a privileged \`pkg/\` staging dir inside
+              # \$startdir. cargo's fingerprint scan trips on its
+              # restricted permissions, so build in a clean copy that
+              # doesn't contain pkg/.
+              local clean="\$startdir/build-clean"
+              GIT_SHA=\$(cd "\$startdir" && git rev-parse --short HEAD 2>/dev/null || echo unknown)
+              rm -rf "\$clean"
+              mkdir -p "\$clean"
+              cp -r "\$startdir"/{src,Cargo.toml,Cargo.lock,build.rs,data} "\$clean/"
+              cd "\$clean"
+              GIT_SHA="\$GIT_SHA" cargo build --release --locked
           }
 
           package() {
-              cd "\$startdir"
-              install -Dm755 target/release/rendermd "\$pkgdir/usr/bin/rendermd"
-              install -Dm644 io.github.rendermd.RenderMD.desktop \\
+              install -Dm755 "\$startdir/build-clean/target/release/rendermd" \\
+                  "\$pkgdir/usr/bin/rendermd"
+              install -Dm644 "\$startdir/io.github.rendermd.RenderMD.desktop" \\
                   "\$pkgdir/usr/share/applications/io.github.rendermd.RenderMD.desktop"
-              install -Dm644 data/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg \\
+              install -Dm644 "\$startdir/data/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg" \\
                   "\$pkgdir/usr/share/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg"
-              install -Dm644 README.md "\$pkgdir/usr/share/doc/rendermd/README.md"
+              install -Dm644 "\$startdir/README.md" "\$pkgdir/usr/share/doc/rendermd/README.md"
           }
           EOF
           chown builder:builder PKGBUILD
