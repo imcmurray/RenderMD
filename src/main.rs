@@ -1307,11 +1307,7 @@ fn html_escape(input: &str) -> String {
 // Empty string when there's no history. When `visible` is false but
 // commits exist, returns just an unobtrusive hint dot so the user
 // knows the option is there.
-fn build_history_rail_html(
-    commits: &[Commit],
-    viewing_sha: Option<&str>,
-    visible: bool,
-) -> String {
+fn build_history_rail_html(commits: &[Commit], viewing_sha: Option<&str>, visible: bool) -> String {
     if commits.is_empty() {
         return String::new();
     }
@@ -1331,7 +1327,9 @@ fn build_history_rail_html(
             .to_string();
     }
 
-    let mut html = String::from(r#"<div class="rmd-history-rail" role="navigation" aria-label="Commit history">"#);
+    let mut html = String::from(
+        r#"<div class="rmd-history-rail" role="navigation" aria-label="Commit history">"#,
+    );
     html.push_str(r#"<div class="rmd-history-track"></div>"#);
     for c in commits {
         let active = viewing_sha.map(|v| v == c.sha).unwrap_or(false);
@@ -2332,9 +2330,7 @@ impl State {
                     | gdk::ModifierType::SHIFT_MASK
                     | gdk::ModifierType::ALT_MASK
                     | gdk::ModifierType::SUPER_MASK);
-            if m == gdk::ModifierType::CONTROL_MASK
-                && (key == gdk::Key::v || key == gdk::Key::V)
-            {
+            if m == gdk::ModifierType::CONTROL_MASK && (key == gdk::Key::v || key == gdk::Key::V) {
                 st.try_paste_image_or_text();
                 return glib::Propagation::Stop;
             }
@@ -2833,11 +2829,8 @@ impl State {
         let final_html = match s.git_history.borrow().as_ref() {
             Some(commits) => {
                 let viewing = s.viewing_snapshot.borrow().as_ref().map(|s| s.sha.clone());
-                let rail = build_history_rail_html(
-                    commits,
-                    viewing.as_deref(),
-                    s.history_visible.get(),
-                );
+                let rail =
+                    build_history_rail_html(commits, viewing.as_deref(), s.history_visible.get());
                 if rail.is_empty() {
                     html
                 } else {
@@ -3648,7 +3641,11 @@ impl State {
         let now = !self.inner.history_visible.get();
         self.inner.history_visible.set(now);
         if self.inner.git_history.borrow().is_some() {
-            self.show_toast(if now { "History rail shown" } else { "History rail hidden" });
+            self.show_toast(if now {
+                "History rail shown"
+            } else {
+                "History rail hidden"
+            });
         } else {
             self.show_toast("This file isn't tracked in a git repo");
         }
