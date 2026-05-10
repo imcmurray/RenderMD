@@ -216,6 +216,16 @@ img {
   background: rgba(227, 179, 65, 0.06);
 }
 .rmd-prev-empty { color: var(--muted); }
+/* Swap content needs to wrap so long lines stay visible — the
+ * mouseleave revert means the user can't scroll horizontally. */
+.rmd-showing-prev,
+.rmd-showing-prev pre,
+.rmd-showing-prev code {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+}
 .rmd-img-wrapper {
   position: relative;
   display: inline-block;
@@ -1469,8 +1479,17 @@ fn inject_change_markers(text: &str, changes: &PendingChanges, dark: bool) -> St
         };
         let old_block = slice(&old_lines);
         let new_block = slice(&new_lines);
-        let annotated_md = build_annotated_diff_md(&old_block, &new_block);
-        let prev_html = render_block_to_inline_html(&annotated_md, dark);
+        // Fenced code blocks need a different code path: comrak escapes
+        // anything inside <pre><code>, so our <del>/<ins>-annotated
+        // markdown shows up as literal HTML tags. For these, build the
+        // diff HTML ourselves and bypass comrak.
+        let prev_html =
+            if block_starts_with_fence(&new_block) || block_starts_with_fence(&old_block) {
+                build_code_block_diff_html(&old_block, &new_block)
+            } else {
+                let annotated_md = build_annotated_diff_md(&old_block, &new_block);
+                render_block_to_inline_html(&annotated_md, dark)
+            };
         let escaped = glib::Uri::escape_string(&prev_html, None, false).to_string();
         markers.insert(
             start,
@@ -1750,6 +1769,129 @@ fn build_annotated_word_diff_md(old: &str, new: &str) -> String {
         push_ins(&mut out, a);
     }
     out
+}
+
+fn block_starts_with_fence(text: &str) -> bool {
+    let first = text.lines().next().unwrap_or("").trim_start();
+    first.starts_with("```") || first.starts_with("~~~")
+}
+
+// Inline HTML span for a chunk of word-diffed code. Same shape as the
+// markdown-side word-diff but emits HTML directly so it survives being
+// placed inside <pre><code>.
+fn render_word_diff_html(old: &str, new: &str) -> String {
+    let old_tokens = tokenize_for_diff(old);
+    let new_tokens = tokenize_for_diff(new);
+    let mut out = String::new();
+    let mut i = 0usize;
+    let mut pending_adds: Vec<&str> = Vec::new();
+    let push_del = |out: &mut String, s: &str| {
+        out.push_str(r#"<span class="rmd-diff-w-del">"#);
+        out.push_str(&html_escape(s));
+        out.push_str("</span>");
+    };
+    let push_ins = |out: &mut String, s: &str| {
+        out.push_str(r#"<span class="rmd-diff-w-add">"#);
+        out.push_str(&html_escape(s));
+        out.push_str("</span>");
+    };
+    for new_t in &new_tokens {
+        let found = old_tokens[i..].iter().position(|t| t == new_t);
+        match found {
+            Some(rel) => {
+                for tok in old_tokens.iter().skip(i).take(rel) {
+                    push_del(&mut out, tok);
+                }
+                for a in pending_adds.drain(..) {
+                    push_ins(&mut out, a);
+                }
+                out.push_str(&html_escape(new_t));
+                i += rel + 1;
+            }
+            None => pending_adds.push(new_t),
+        }
+    }
+    for tok in old_tokens.iter().skip(i) {
+        push_del(&mut out, tok);
+    }
+    for a in pending_adds.drain(..) {
+        push_ins(&mut out, a);
+    }
+    out
+}
+
+// HTML diff for a fenced code block. Strips the fence lines, runs the
+// same line + word diff machinery as build_annotated_diff_md, but emits
+// <span> tags directly so they survive inside the <pre><code> wrapper.
+fn build_code_block_diff_html(old: &str, new: &str) -> String {
+    const MOD_THRESHOLD: f64 = 0.30;
+    fn strip_fences(text: &str) -> Vec<&str> {
+        let mut lines: Vec<&str> = text.lines().collect();
+        if let Some(first) = lines.first() {
+            let trimmed = first.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                lines.remove(0);
+            }
+        }
+        if let Some(last) = lines.last() {
+            let trimmed = last.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                lines.pop();
+            }
+        }
+        lines
+    }
+    let old_lines = strip_fences(old);
+    let new_lines = strip_fences(new);
+    let ops = line_diff_ops(&old_lines, &new_lines);
+
+    let mut body = String::new();
+    let mut idx = 0usize;
+    while idx < ops.len() {
+        if let LineOp::Equal(line) = &ops[idx] {
+            body.push_str(&html_escape(line));
+            body.push('\n');
+            idx += 1;
+            continue;
+        }
+        let mut adds: Vec<&str> = Vec::new();
+        let mut dels: Vec<&str> = Vec::new();
+        while idx < ops.len() {
+            match &ops[idx] {
+                LineOp::Add(s) => adds.push(s),
+                LineOp::Delete(s) => dels.push(s),
+                LineOp::Equal(_) => break,
+            }
+            idx += 1;
+        }
+        let pair_count = adds.len().min(dels.len());
+        for i in 0..pair_count {
+            let old_line = dels[i];
+            let new_line = adds[i];
+            if line_similarity(old_line, new_line) >= MOD_THRESHOLD {
+                body.push_str(&render_word_diff_html(old_line, new_line));
+                body.push('\n');
+            } else {
+                body.push_str(r#"<span class="rmd-diff-w-del">"#);
+                body.push_str(&html_escape(old_line));
+                body.push_str("</span>\n");
+                body.push_str(r#"<span class="rmd-diff-w-add">"#);
+                body.push_str(&html_escape(new_line));
+                body.push_str("</span>\n");
+            }
+        }
+        for line in dels.iter().skip(pair_count) {
+            body.push_str(r#"<span class="rmd-diff-w-del">"#);
+            body.push_str(&html_escape(line));
+            body.push_str("</span>\n");
+        }
+        for line in adds.iter().skip(pair_count) {
+            body.push_str(r#"<span class="rmd-diff-w-add">"#);
+            body.push_str(&html_escape(line));
+            body.push_str("</span>\n");
+        }
+    }
+    format!("<pre><code>{body}</code></pre>")
 }
 
 // Builds annotated markdown for a whole changed block. Equal lines pass
