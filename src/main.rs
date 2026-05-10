@@ -2491,17 +2491,33 @@ impl State {
 
     // -- About / shortcuts ----------------------------------------------
     fn action_about(&self) {
+        const REPO_URL: &str = "https://github.com/imcmurray/RenderMD";
+        let sha = env!("GIT_SHA");
+        let version = if sha == "unknown" {
+            env!("CARGO_PKG_VERSION").to_string()
+        } else {
+            format!("{} ({})", env!("CARGO_PKG_VERSION"), sha)
+        };
+
         let about = adw::AboutDialog::builder()
             .application_name(APP_NAME)
             .application_icon(APP_ID)
             .developer_name("You + Claude")
-            .version(env!("CARGO_PKG_VERSION"))
+            .version(&version)
             .comments(
                 "A native GTK4 Markdown viewer/editor with one-key toggle between rendered preview and editing.",
             )
             .license_type(gtk::License::MitX11)
-            .website("https://github.com/")
+            .website(REPO_URL)
+            .issue_url(format!("{}/issues", REPO_URL))
             .build();
+
+        // Direct link to the exact commit this binary was built from.
+        // Skipped when the SHA is unknown (e.g. building from a tarball).
+        if sha != "unknown" {
+            about.add_link("View this commit", &format!("{}/commit/{}", REPO_URL, sha));
+        }
+
         about.present(Some(&self.inner.window));
     }
 
