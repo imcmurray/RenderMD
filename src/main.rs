@@ -243,6 +243,95 @@ img {
 .rmd-img-dragging { opacity: 0.55; }
 .rmd-img-dragging .rmd-img-handle { display: none; }
 .rmd-img-dragging:hover { outline: 2px solid var(--accent); }
+.rmd-history-rail {
+  position: fixed;
+  left: 8px;
+  top: 24px;
+  bottom: 24px;
+  width: 22px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  z-index: 50;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.rmd-history-track {
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 1px;
+  background: var(--border);
+  pointer-events: none;
+}
+.rmd-history-circle {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  border: 1px solid var(--bg);
+  margin: 5px 0;
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+  transition: transform 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
+  flex-shrink: 0;
+}
+.rmd-history-circle:hover {
+  transform: scale(1.5);
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+.rmd-history-circle.rmd-history-active {
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+.rmd-history-hint {
+  position: fixed;
+  left: 14px;
+  top: 32px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: 0.4;
+  z-index: 50;
+  cursor: pointer;
+  transition: opacity 0.12s, transform 0.12s, background 0.12s;
+}
+.rmd-history-hint:hover {
+  opacity: 0.9;
+  transform: scale(1.6);
+  background: var(--accent);
+}
+.rmd-minimap {
+  position: fixed;
+  right: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 14px;
+  z-index: 60;
+  pointer-events: auto;
+}
+.rmd-minimap-tick {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  height: 4px;
+  background: var(--change);
+  border-radius: 2px;
+  cursor: pointer;
+  opacity: 0.55;
+  margin-top: -2px;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.rmd-minimap-tick:hover {
+  opacity: 1;
+  transform: scaleX(1.7);
+}
 .rmd-prev-banner {
   font-size: 0.68em;
   font-weight: 500;
@@ -968,6 +1057,150 @@ fn preprocess_mermaid_blocks(text: &str) -> (String, bool) {
     (out, had_mermaid)
 }
 
+// One commit affecting the open file, returned by `git log` and used to
+// populate the history rail in the preview. `sha` is the full hash;
+// `short_sha` is what we display.
+#[derive(Clone, Debug)]
+struct Commit {
+    sha: String,
+    short_sha: String,
+    iso_date: String,
+    subject: String,
+}
+
+// State for "viewing a historical revision" mode. The buffer is left
+// alone; `text` is what the preview renders. `parent_text` (when
+// present) lets us show diff markers against the parent commit using
+// the existing change-marker pipeline. `commit_unix_secs` populates
+// the hover banner's "X ago" label.
+#[derive(Clone, Debug)]
+struct HistorySnapshot {
+    sha: String,
+    text: String,
+    parent_text: Option<String>,
+    commit_unix_secs: i64,
+}
+
+// Run `git log --follow` for the file and return the commit list, newest
+// first. Returns None if git isn't installed, the file isn't in a repo,
+// the file isn't tracked, or git errored. Capped at 100 commits to keep
+// the rail manageable on long-lived files; a "show more" affordance is
+// future work.
+fn fetch_git_history(file_path: &Path) -> Option<Vec<Commit>> {
+    let parent = file_path.parent()?;
+    let file_name = file_path.file_name()?.to_str()?;
+
+    // Cheap check: are we inside a working tree at all?
+    let in_repo = std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(parent)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .is_some();
+    if !in_repo {
+        return None;
+    }
+
+    let output = std::process::Command::new("git")
+        .args([
+            "log",
+            "--follow",
+            "-n",
+            "100",
+            "--pretty=format:%H%x09%h%x09%cI%x09%s",
+            "--",
+            file_name,
+        ])
+        .current_dir(parent)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let commits: Vec<Commit> = stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\t');
+            Some(Commit {
+                sha: parts.next()?.to_string(),
+                short_sha: parts.next()?.to_string(),
+                iso_date: parts.next()?.to_string(),
+                subject: parts.next()?.to_string(),
+            })
+        })
+        .collect();
+    if commits.is_empty() {
+        None
+    } else {
+        Some(commits)
+    }
+}
+
+// Resolve the working tree's toplevel and the file's path relative to
+// it. Needed for `git show <sha>:<relpath>`.
+fn repo_relative(file_path: &Path) -> Option<(PathBuf, String)> {
+    let parent = file_path.parent()?;
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(parent)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let toplevel = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let toplevel_path = PathBuf::from(toplevel);
+    let rel = file_path.strip_prefix(&toplevel_path).ok()?;
+    Some((toplevel_path, rel.to_string_lossy().to_string()))
+}
+
+// Read the file's content at a given commit. Returns None for renamed
+// files (would need `git log --follow --name-only` to track) or other
+// `git show` failures.
+fn fetch_revision_text(file_path: &Path, sha: &str) -> Option<String> {
+    let (toplevel, rel) = repo_relative(file_path)?;
+    let arg = format!("{sha}:{rel}");
+    let output = std::process::Command::new("git")
+        .args(["show", &arg])
+        .current_dir(&toplevel)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// Get the parent SHA of a given commit. Returns None for the root
+// commit (no parent) or on any git error.
+fn fetch_parent_sha(file_path: &Path, sha: &str) -> Option<String> {
+    let parent = file_path.parent()?;
+    let parent_arg = format!("{sha}^");
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--quiet", &parent_arg])
+        .current_dir(parent)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn iso_to_unix_secs(iso: &str) -> i64 {
+    glib::DateTime::from_iso8601(iso, None)
+        .map(|d| d.to_unix())
+        .unwrap_or(0)
+}
+
 fn format_mtime(path: &Path) -> String {
     let modified = match fs::metadata(path).and_then(|m| m.modified()) {
         Ok(t) => t,
@@ -1067,6 +1300,73 @@ fn html_escape(input: &str) -> String {
         }
     }
     out
+}
+
+// Build the HTML for the left-side commit timeline. Returns the rail
+// markup plus a small <script> that wires click messages back to Rust.
+// Empty string when there's no history. When `visible` is false but
+// commits exist, returns just an unobtrusive hint dot so the user
+// knows the option is there.
+fn build_history_rail_html(
+    commits: &[Commit],
+    viewing_sha: Option<&str>,
+    visible: bool,
+) -> String {
+    if commits.is_empty() {
+        return String::new();
+    }
+    if !visible {
+        // Click handler so the hint dot itself toggles history back on.
+        return r##"<div class="rmd-history-hint" title="Git history available — click to show"></div>
+<script>
+(function() {
+  var msg = (window.webkit && window.webkit.messageHandlers) || null;
+  if (!msg || !msg.toggleHistory) return;
+  var hint = document.querySelector(".rmd-history-hint");
+  if (hint) hint.addEventListener("click", function() {
+    msg.toggleHistory.postMessage("");
+  });
+})();
+</script>"##
+            .to_string();
+    }
+
+    let mut html = String::from(r#"<div class="rmd-history-rail" role="navigation" aria-label="Commit history">"#);
+    html.push_str(r#"<div class="rmd-history-track"></div>"#);
+    for c in commits {
+        let active = viewing_sha.map(|v| v == c.sha).unwrap_or(false);
+        let date = c.iso_date.split('T').next().unwrap_or(&c.iso_date);
+        let tooltip = format!("{} — {}\n{}", c.short_sha, date, c.subject);
+        let cls = if active {
+            "rmd-history-circle rmd-history-active"
+        } else {
+            "rmd-history-circle"
+        };
+        html.push_str(&format!(
+            r#"<button type="button" class="{cls}" data-sha="{sha}" title="{title}"></button>"#,
+            cls = cls,
+            sha = html_escape(&c.sha),
+            title = html_escape(&tooltip),
+        ));
+    }
+    html.push_str("</div>");
+    // Click handler — Phase 2 will hook this up to render the chosen
+    // revision. For now, posts the SHA to the `commitClick` handler
+    // so we can verify wiring end-to-end.
+    html.push_str(
+        r#"<script>
+(function() {
+  var msg = (window.webkit && window.webkit.messageHandlers) || null;
+  if (!msg || !msg.commitClick) return;
+  document.querySelectorAll(".rmd-history-circle").forEach(function(c) {
+    c.addEventListener("click", function() {
+      msg.commitClick.postMessage(c.getAttribute("data-sha") || "");
+    });
+  });
+})();
+</script>"#,
+    );
+    html
 }
 
 // Multiset line-subtraction diff: lines that appear more often in `new` than
@@ -1261,12 +1561,49 @@ const CHANGE_TOOLTIP_JS: &str = r#"<script>
         }
       });
     });
+    buildMinimap();
+  }
+  // Right-edge minimap of all changed blocks. Ticks are positioned
+  // proportionally to where their target block sits in the document so
+  // the user can see at a glance where edits landed in a long file,
+  // and click any tick to scroll there.
+  function buildMinimap() {
+    var existing = document.querySelector(".rmd-minimap");
+    if (existing) existing.remove();
+    var markers = document.querySelectorAll(".rmd-changed-marker");
+    if (!markers.length) return;
+    var docHeight = document.documentElement.scrollHeight;
+    if (docHeight <= window.innerHeight + 4) return;
+    var minimap = document.createElement("div");
+    minimap.className = "rmd-minimap";
+    markers.forEach(function(m) {
+      var target = m.nextElementSibling;
+      if (!target) return;
+      var rect = target.getBoundingClientRect();
+      var topInDoc = rect.top + window.scrollY;
+      var ratio = Math.max(0, Math.min(1, topInDoc / docHeight));
+      var tick = document.createElement("div");
+      tick.className = "rmd-minimap-tick";
+      tick.style.top = (ratio * 100) + "%";
+      tick.title = "Changed block — click to jump";
+      tick.addEventListener("click", function() {
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+      });
+      minimap.appendChild(tick);
+    });
+    document.body.appendChild(minimap);
   }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init);
   } else {
     init();
   }
+  // Recompute on resize so tick positions stay accurate.
+  var resizeTimer = null;
+  window.addEventListener("resize", function() {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(buildMinimap, 120);
+  });
 })();
 </script>
 "#;
@@ -1613,6 +1950,15 @@ struct StateInner {
     // the prior content and how long ago the edit happened. Cleared on any
     // open/new so stale change marks can't leak across files.
     pending_changes: RefCell<Option<PendingChanges>>,
+
+    // Git history rail state. `git_history` is the commit list for the
+    // current file (None if the file isn't in a git repo).
+    // `viewing_snapshot` holds the historical revision the preview is
+    // rendering from, or None for the working copy. `history_visible`
+    // toggles the rail on/off.
+    git_history: RefCell<Option<Vec<Commit>>>,
+    viewing_snapshot: RefCell<Option<HistorySnapshot>>,
+    history_visible: Cell<bool>,
     toggle_handler: RefCell<Option<glib::SignalHandlerId>>,
     buffer_handler: RefCell<Option<glib::SignalHandlerId>>,
 
@@ -1669,6 +2015,9 @@ impl State {
             mode: RefCell::new(MODE_PREVIEW.to_string()),
             suppress_modify: Cell::new(false),
             pending_changes: RefCell::new(None),
+            git_history: RefCell::new(None),
+            viewing_snapshot: RefCell::new(None),
+            history_visible: Cell::new(true),
             toggle_handler: RefCell::new(None),
             buffer_handler: RefCell::new(None),
             watcher: RefCell::new(None),
@@ -1874,6 +2223,7 @@ impl State {
 
         let view_section = gio::Menu::new();
         view_section.append(Some("Toggle Preview / Edit"), Some("win.toggle"));
+        view_section.append(Some("Toggle Git History"), Some("win.toggle-history"));
         menu.append_section(Some("View"), &view_section);
 
         let help_section = gio::Menu::new();
@@ -1935,6 +2285,11 @@ impl State {
                 "shortcuts",
                 Box::new(|st: &State| st.action_shortcuts()),
                 &["<Primary>question"],
+            ),
+            (
+                "toggle-history",
+                Box::new(|st: &State| st.action_toggle_history()),
+                &["<Primary><Alt>h"],
             ),
         ];
 
@@ -2062,6 +2417,9 @@ impl State {
         manager.register_script_message_handler("imageClick", None);
         manager.register_script_message_handler("imageResize", None);
         manager.register_script_message_handler("imageMove", None);
+        manager.register_script_message_handler("commitClick", None);
+        manager.register_script_message_handler("toggleHistory", None);
+        manager.register_script_message_handler("scrollTo", None);
 
         let st = self.clone();
         manager.connect_script_message_received(Some("imageClick"), move |_, value| {
@@ -2075,6 +2433,93 @@ impl State {
         manager.connect_script_message_received(Some("imageMove"), move |_, value| {
             st.handle_image_move(&value.to_str());
         });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("commitClick"), move |_, value| {
+            st.handle_commit_click(&value.to_str());
+        });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("toggleHistory"), move |_, _value| {
+            st.action_toggle_history();
+        });
+    }
+
+    fn handle_commit_click(&self, sha: &str) {
+        let sha = sha.trim();
+        if sha.is_empty() {
+            return;
+        }
+
+        // Click the active commit again to return to the working copy.
+        let already_viewing = self
+            .inner
+            .viewing_snapshot
+            .borrow()
+            .as_ref()
+            .map(|s| s.sha == sha)
+            .unwrap_or(false);
+        if already_viewing {
+            *self.inner.viewing_snapshot.borrow_mut() = None;
+            self.show_toast("Returned to working copy");
+            self.refresh_preview();
+            return;
+        }
+
+        let path = match self.inner.current_file.borrow().clone() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let text = match fetch_revision_text(&path, sha) {
+            Some(t) => t,
+            None => {
+                self.show_toast("Couldn't fetch that revision (file may have been renamed)");
+                return;
+            }
+        };
+
+        // Parent (if any) gives us a baseline for the diff markers.
+        let parent_text =
+            fetch_parent_sha(&path, sha).and_then(|psha| fetch_revision_text(&path, &psha));
+
+        // Find the commit in our cached history to get its date + subject.
+        let history = self.inner.git_history.borrow();
+        let commit = history
+            .as_ref()
+            .and_then(|cs| cs.iter().find(|c| c.sha == sha))
+            .cloned();
+        drop(history);
+        let commit_unix = commit
+            .as_ref()
+            .map(|c| iso_to_unix_secs(&c.iso_date))
+            .unwrap_or(0);
+        let toast_msg = match commit {
+            Some(c) => format!("Viewing {} — {}", c.short_sha, c.subject),
+            None => format!("Viewing {}", &sha[..sha.len().min(7)]),
+        };
+
+        // Wire up the change-marker pipeline against the parent text so
+        // the user gets the same yellow-bar + hover-diff view they're
+        // used to from external edits.
+        if let Some(p_text) = parent_text.as_ref() {
+            let changed = compute_changed_lines(p_text, &text);
+            if !changed.is_empty() {
+                *self.inner.pending_changes.borrow_mut() = Some(PendingChanges {
+                    changed_lines: changed,
+                    old_text: p_text.clone(),
+                    reload_ts: commit_unix,
+                });
+            }
+        }
+
+        *self.inner.viewing_snapshot.borrow_mut() = Some(HistorySnapshot {
+            sha: sha.to_string(),
+            text,
+            parent_text,
+            commit_unix_secs: commit_unix,
+        });
+
+        self.show_toast(&toast_msg);
+        self.refresh_preview();
     }
 
     fn handle_image_click(&self, message: &str) {
@@ -2345,7 +2790,28 @@ impl State {
     // -- Preview ---------------------------------------------------------
     fn refresh_preview(&self) {
         let s = &self.inner;
-        let mut text = self.buffer_text();
+        // When viewing a historical revision, render the snapshot text
+        // instead of the working copy. The buffer is left alone. Also
+        // re-populate pending_changes from the snapshot so diff markers
+        // persist across refreshes (theme switch, mode toggle, etc.).
+        let mut text = match s.viewing_snapshot.borrow().as_ref() {
+            Some(snap) => {
+                if s.pending_changes.borrow().is_none() {
+                    if let Some(parent) = &snap.parent_text {
+                        let changed = compute_changed_lines(parent, &snap.text);
+                        if !changed.is_empty() {
+                            *s.pending_changes.borrow_mut() = Some(PendingChanges {
+                                changed_lines: changed,
+                                old_text: parent.clone(),
+                                reload_ts: snap.commit_unix_secs,
+                            });
+                        }
+                    }
+                }
+                snap.text.clone()
+            }
+            None => self.buffer_text(),
+        };
         if let Some(changes) = s.pending_changes.borrow_mut().take() {
             text = inject_change_markers(&text, &changes, self.is_dark());
         }
@@ -2360,10 +2826,31 @@ impl State {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| APP_NAME.to_string());
         let html = render_markdown_to_html(&text, Some(&base_dir), self.is_dark(), &title);
+
+        // Inject the git history rail just before </body> when available.
+        // Stays out of the way (no rail markup at all) when the file
+        // isn't in a git repo.
+        let final_html = match s.git_history.borrow().as_ref() {
+            Some(commits) => {
+                let viewing = s.viewing_snapshot.borrow().as_ref().map(|s| s.sha.clone());
+                let rail = build_history_rail_html(
+                    commits,
+                    viewing.as_deref(),
+                    s.history_visible.get(),
+                );
+                if rail.is_empty() {
+                    html
+                } else {
+                    html.replacen("</body>", &format!("{}\n</body>", rail), 1)
+                }
+            }
+            None => html,
+        };
+
         let path_str = base_dir.to_string_lossy();
         let escaped = glib::Uri::escape_string(&path_str, Some("/"), false).to_string();
         let base_uri = format!("file://{}/", escaped);
-        s.webview.load_html(&html, Some(&base_uri));
+        s.webview.load_html(&final_html, Some(&base_uri));
     }
 
     // -- Theme -----------------------------------------------------------
@@ -2732,6 +3219,11 @@ impl State {
         // a different file or a stale baseline. reload_from_disk re-sets this
         // *after* calling load_text.
         *self.inner.pending_changes.borrow_mut() = None;
+        // Fetch git history for the new file (None if not in a repo).
+        // Synchronous for now — capped at 100 commits keeps it cheap.
+        let history = path.as_ref().and_then(|p| fetch_git_history(p));
+        *self.inner.git_history.borrow_mut() = history;
+        *self.inner.viewing_snapshot.borrow_mut() = None;
         self.mark_clean();
         self.update_title();
         self.update_watch(path.as_deref());
@@ -2930,6 +3422,15 @@ impl State {
     fn on_buffer_changed(&self) {
         if self.inner.suppress_modify.get() {
             return;
+        }
+        // Editing the working copy while viewing history: snap back to
+        // the working copy so the preview stays consistent with what
+        // they're typing.
+        if self.inner.viewing_snapshot.borrow().is_some() {
+            *self.inner.viewing_snapshot.borrow_mut() = None;
+            if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                self.refresh_preview();
+            }
         }
         if !self.inner.is_modified.get() {
             self.inner.is_modified.set(true);
@@ -3142,7 +3643,21 @@ impl State {
         dialog.present(Some(&self.inner.window));
     }
 
-    // -- Window state persistence ---------------------------------------
+    // -- Git history toggle ---------------------------------------------
+    fn action_toggle_history(&self) {
+        let now = !self.inner.history_visible.get();
+        self.inner.history_visible.set(now);
+        if self.inner.git_history.borrow().is_some() {
+            self.show_toast(if now { "History rail shown" } else { "History rail hidden" });
+        } else {
+            self.show_toast("This file isn't tracked in a git repo");
+        }
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
+    }
+
+    // -- Window + UI settings persistence -------------------------------
     fn restore_window_state(&self) {
         let path = settings_file();
         if !path.exists() {
@@ -3161,6 +3676,10 @@ impl State {
         if maxd {
             self.inner.window.maximize();
         }
+        // Default to true if the key isn't present yet — first-run users
+        // should see the rail when they open something in a git repo.
+        let history = kf.boolean("ui", "history-visible").unwrap_or(true);
+        self.inner.history_visible.set(history);
     }
 
     fn save_window_state(&self) {
@@ -3173,6 +3692,7 @@ impl State {
         kf.set_integer("window", "width", w);
         kf.set_integer("window", "height", h);
         kf.set_boolean("window", "maximized", self.inner.window.is_maximized());
+        kf.set_boolean("ui", "history-visible", self.inner.history_visible.get());
         let _ = kf.save_to_file(settings_file());
     }
 }
