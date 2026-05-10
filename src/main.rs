@@ -216,6 +216,33 @@ img {
   background: rgba(227, 179, 65, 0.06);
 }
 .rmd-prev-empty { color: var(--muted); }
+.rmd-img-wrapper {
+  position: relative;
+  display: inline-block;
+  line-height: 0;
+  max-width: 100%;
+}
+.rmd-img-wrapper img { display: block; max-width: 100%; height: auto; }
+.rmd-img-wrapper:hover { outline: 1px dashed var(--accent); outline-offset: 1px; }
+.rmd-img-handle {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  background: var(--bg);
+  border: 2px solid var(--accent);
+  border-radius: 2px;
+  opacity: 0;
+  transition: opacity 0.12s;
+  z-index: 5;
+}
+.rmd-img-wrapper:hover .rmd-img-handle { opacity: 1; }
+.rmd-img-handle-nw { top: -7px; left: -7px; cursor: nwse-resize; }
+.rmd-img-handle-ne { top: -7px; right: -7px; cursor: nesw-resize; }
+.rmd-img-handle-sw { bottom: -7px; left: -7px; cursor: nesw-resize; }
+.rmd-img-handle-se { bottom: -7px; right: -7px; cursor: nwse-resize; }
+.rmd-img-dragging { opacity: 0.55; }
+.rmd-img-dragging .rmd-img-handle { display: none; }
+.rmd-img-dragging:hover { outline: 2px solid var(--accent); }
 .rmd-prev-banner {
   font-size: 0.68em;
   font-weight: 500;
@@ -282,8 +309,196 @@ const HTML_TEMPLATE: &str = r#"<!doctype html>
 <body>
 {BODY}
 {MERMAID_SCRIPT}
+{IMAGE_CLICK_JS}
 </body>
 </html>
+"#;
+
+// Image interactions in the rendered preview:
+//   - Hover an image: 4 corner handles fade in.
+//   - Drag a corner: live-resize, post `imageResize` (src\twidth\talt) on release.
+//   - Mousedown on the image body: tracks for click vs drag.
+//       * Released without moving: post `imageClick` to open the options dialog.
+//       * Moved past a small threshold: drag-to-move; an insertion line
+//         tracks the cursor's nearest gap between top-level blocks. On
+//         release, post `imageMove` (src\ttargetIndex).
+// All no-ops outside the WebView (no webkit handler), so this is safe to
+// embed unconditionally — exported HTML files just see static images.
+const IMAGE_CLICK_JS: &str = r#"<script>
+(function() {
+  var msg = (window.webkit && window.webkit.messageHandlers) || null;
+  if (!msg || (!msg.imageClick && !msg.imageResize && !msg.imageMove)) return;
+  function send(name, payload) {
+    if (msg[name]) msg[name].postMessage(payload);
+  }
+  function setupImage(img) {
+    if (img.dataset.rmdSetup) return;
+    img.dataset.rmdSetup = "1";
+    var wrap = document.createElement("span");
+    wrap.className = "rmd-img-wrapper";
+    img.parentNode.insertBefore(wrap, img);
+    wrap.appendChild(img);
+    ["nw","ne","sw","se"].forEach(function(corner) {
+      var h = document.createElement("span");
+      h.className = "rmd-img-handle rmd-img-handle-" + corner;
+      wrap.appendChild(h);
+      h.addEventListener("mousedown", function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        startResize(e, img, corner);
+      });
+    });
+    img.addEventListener("mousedown", function(e) {
+      if (e.button !== 0) return;
+      if (e.target !== img) return;
+      e.preventDefault();
+      startMaybeMove(e, img);
+    });
+    img.addEventListener("dragstart", function(e) { e.preventDefault(); });
+  }
+  function startResize(e, img, corner) {
+    var startX = e.clientX;
+    var startW = img.offsetWidth || img.naturalWidth || 200;
+    var startH = img.offsetHeight || img.naturalHeight || 200;
+    var aspect = startW / Math.max(1, startH);
+    function onMove(ev) {
+      var dx = ev.clientX - startX;
+      var sign = (corner === "ne" || corner === "se") ? 1 : -1;
+      var newW = Math.max(40, Math.round(startW + sign * dx));
+      img.style.width = newW + "px";
+      img.style.height = Math.round(newW / aspect) + "px";
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      var finalW = Math.round(img.offsetWidth);
+      var src = img.getAttribute("src") || "";
+      var alt = img.getAttribute("alt") || "";
+      send("imageResize", src + "\t" + finalW + "\t" + alt);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+  // Drop targets are individual image wrappers in document order. This
+  // way the user can drop "between" two images regardless of whether
+  // they're each in their own paragraph (stacked) or side-by-side
+  // inline within one paragraph.
+  function dropTargets(dragWrapper) {
+    return Array.from(document.querySelectorAll(".rmd-img-wrapper"))
+      .filter(function(w) { return w !== dragWrapper; });
+  }
+  // "Before" a wrapper: cursor is above it (block layout) OR on the
+  // same line and to the left of its midpoint (inline layout).
+  function isBefore(x, y, rect) {
+    if (y < rect.top) return true;
+    if (y > rect.bottom) return false;
+    return x < rect.left + rect.width / 2;
+  }
+  function dropIndexFor(wrapper, x, y) {
+    var targets = dropTargets(wrapper);
+    for (var i = 0; i < targets.length; i++) {
+      if (isBefore(x, y, targets[i].getBoundingClientRect())) return i;
+    }
+    return targets.length;
+  }
+  // Make-room animation: as the ghost approaches a gap, blocks at and
+  // after the candidate drop position smoothly translate downward by
+  // the dragged image's height. The user sees the existing images
+  // physically slide aside, previewing the post-drop layout.
+  var spacedBlocks = [];
+  function applySpacing(wrapper, idx, height) {
+    var blocks = dropTargets(wrapper);
+    var newSpaced = blocks.slice(idx);
+    // Reset any block that's no longer in the "spaced" set.
+    spacedBlocks.forEach(function(el) {
+      if (newSpaced.indexOf(el) === -1) {
+        el.style.transform = "";
+      }
+    });
+    // Apply to the new set. transition is set once and left in place
+    // for the duration of the drag.
+    newSpaced.forEach(function(el) {
+      if (el.dataset.rmdSpaced !== "1") {
+        el.style.transition = "transform 0.18s ease";
+        el.dataset.rmdSpaced = "1";
+      }
+      el.style.transform = "translateY(" + height + "px)";
+    });
+    spacedBlocks = newSpaced;
+  }
+  function clearSpacing() {
+    spacedBlocks.forEach(function(el) {
+      el.style.transform = "";
+      el.style.transition = "";
+      delete el.dataset.rmdSpaced;
+    });
+    spacedBlocks = [];
+  }
+
+  function startMaybeMove(e, img) {
+    var wrapper = img.parentElement;
+    var startX = e.clientX, startY = e.clientY;
+    var rect = wrapper.getBoundingClientRect();
+    var grabX = startX - rect.left;
+    var grabY = startY - rect.top;
+    var lockedWidth = Math.min(rect.width, 360);
+    var lockedHeight = Math.round(
+      (lockedWidth / Math.max(1, rect.width)) * rect.height
+    );
+    var moved = false;
+    var lastIdx = -1;
+    function onMove(ev) {
+      var dx = ev.clientX - startX, dy = ev.clientY - startY;
+      if (!moved && (Math.abs(dx) > 2 || Math.abs(dy) > 2)) {
+        moved = true;
+        wrapper.classList.add("rmd-img-dragging");
+        // Float the wrapper at cursor position so the cursor smoothly
+        // carries the image around.
+        wrapper.style.position = "fixed";
+        wrapper.style.zIndex = "1000";
+        wrapper.style.pointerEvents = "none";
+        wrapper.style.width = lockedWidth + "px";
+        wrapper.style.height = "auto";
+        wrapper.style.margin = "0";
+      }
+      if (moved) {
+        wrapper.style.left = (ev.clientX - grabX) + "px";
+        wrapper.style.top = (ev.clientY - grabY) + "px";
+        var idx = dropIndexFor(wrapper, ev.clientX, ev.clientY);
+        if (idx !== lastIdx) {
+          applySpacing(wrapper, idx, lockedHeight);
+          lastIdx = idx;
+        }
+      }
+    }
+    function onUp(ev) {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      clearSpacing();
+      var src = img.getAttribute("src") || "";
+      if (!moved) {
+        var width = img.getAttribute("width") || "";
+        var alt = img.getAttribute("alt") || "";
+        send("imageClick", src + "\t" + width + "\t" + alt);
+        return;
+      }
+      // Identify the target image by its src so Rust can locate it in
+      // the buffer regardless of paragraph/inline structure. Empty
+      // targetSrc means "append at end".
+      var targets = dropTargets(wrapper);
+      var targetSrc = "";
+      if (lastIdx >= 0 && lastIdx < targets.length) {
+        var tgtImg = targets[lastIdx].querySelector("img");
+        targetSrc = (tgtImg && tgtImg.getAttribute("src")) || "";
+      }
+      send("imageMove", src + "\t" + targetSrc);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+  document.querySelectorAll("img").forEach(setupImage);
+})();
+</script>
 "#;
 
 // Mermaid.js UMD bundle, embedded so preview works offline. Only injected
@@ -765,6 +980,77 @@ fn format_mtime(path: &Path) -> String {
     match glib::DateTime::from_unix_local(secs).and_then(|dt| dt.format("%Y-%m-%d %H:%M")) {
         Ok(s) => format!("Updated {}", s),
         Err(_) => String::new(),
+    }
+}
+
+fn char_to_byte_offset(text: &str, char_offset: usize) -> usize {
+    text.char_indices()
+        .nth(char_offset)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
+// Locate the markdown or HTML form of an image with the given src in the
+// buffer text. Returns (char_offset, char_len) for the *whole* image
+// expression so the caller can replace it cleanly. Naive: matches the
+// first occurrence; if the same src appears more than once in the doc,
+// only the first is touched. Good enough for typical use.
+fn find_image_ref(text: &str, src: &str) -> Option<(usize, usize)> {
+    // Markdown form: ![alt](src) or ![alt](src "title").
+    let needle = format!("({src}");
+    if let Some(byte_idx) = text.find(&needle) {
+        // Confirm the byte just before is `]` and walk back to find `![`.
+        let before = &text[..byte_idx];
+        if before.ends_with(']') {
+            if let Some(bracket_byte) = before.rfind("![") {
+                // Find the closing `)` after byte_idx.
+                let after_paren_start = byte_idx + 1;
+                if let Some(rel_close) = text[after_paren_start..].find(')') {
+                    let end_byte = after_paren_start + rel_close + 1;
+                    let char_start = text[..bracket_byte].chars().count();
+                    let char_end = text[..end_byte].chars().count();
+                    return Some((char_start, char_end - char_start));
+                }
+            }
+        }
+    }
+    // HTML form: <img ... src="src" ...> or src='src'.
+    for delim in ['"', '\''] {
+        let needle = format!("src={delim}{src}{delim}");
+        if let Some(byte_idx) = text.find(&needle) {
+            let before = &text[..byte_idx];
+            if let Some(img_byte) = before.rfind("<img") {
+                if let Some(rel_close) = text[img_byte..].find('>') {
+                    let end_byte = img_byte + rel_close + 1;
+                    let char_start = text[..img_byte].chars().count();
+                    let char_end = text[..end_byte].chars().count();
+                    return Some((char_start, char_end - char_start));
+                }
+            }
+        }
+    }
+    None
+}
+
+// Build the new markup for an image, preferring markdown form when no
+// width is set so the doc stays clean. Width forces the HTML form since
+// CommonMark doesn't have an inline width syntax.
+fn build_image_markup(src: &str, width: Option<&str>, alt: &str) -> String {
+    match width {
+        None => format!("![{alt}]({src})"),
+        Some(w) => {
+            let alt_attr = if alt.is_empty() {
+                String::new()
+            } else {
+                format!(" alt=\"{}\"", html_escape(alt))
+            };
+            format!(
+                "<img src=\"{}\"{} width=\"{}\">",
+                html_escape(src),
+                alt_attr,
+                html_escape(w)
+            )
+        }
     }
 }
 
@@ -1300,6 +1586,7 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
         .replace("{BASE_HREF}", &base_href)
         .replace("{BODY}", &body)
         .replace("{MERMAID_SCRIPT}", &mermaid_script)
+        .replace("{IMAGE_CLICK_JS}", IMAGE_CLICK_JS)
 }
 
 // ---- App state --------------------------------------------------------------
@@ -1672,6 +1959,313 @@ impl State {
         ));
         s.window.add_action(&quit_action);
         app.set_accels_for_action("win.quit", &["<Primary>q", "<Primary>w"]);
+    }
+
+    // -- Image paste -----------------------------------------------------
+    // Intercept Ctrl+V on the source view: if the clipboard has an image,
+    // save it next to the .md file and insert a markdown reference. Falls
+    // back to the standard text paste when there's no image (which is the
+    // overwhelmingly common case).
+    fn setup_image_paste(&self) {
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let st = self.clone();
+        key.connect_key_pressed(move |_, key, _kc, modifiers| {
+            // Strip lock modifiers so Caps/Num lock don't break the match.
+            let m = modifiers
+                & (gdk::ModifierType::CONTROL_MASK
+                    | gdk::ModifierType::SHIFT_MASK
+                    | gdk::ModifierType::ALT_MASK
+                    | gdk::ModifierType::SUPER_MASK);
+            if m == gdk::ModifierType::CONTROL_MASK
+                && (key == gdk::Key::v || key == gdk::Key::V)
+            {
+                st.try_paste_image_or_text();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.inner.source_view.add_controller(key);
+    }
+
+    fn try_paste_image_or_text(&self) {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        let clipboard = display.clipboard();
+        let st = self.clone();
+        let clipboard_for_fallback = clipboard.clone();
+        clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| match result {
+            Ok(Some(texture)) => st.paste_image_to_buffer(&texture),
+            _ => {
+                st.inner
+                    .buffer
+                    .paste_clipboard(&clipboard_for_fallback, None, true);
+            }
+        });
+    }
+
+    fn paste_image_to_buffer(&self, texture: &gdk::Texture) {
+        let path = match self.inner.current_file.borrow().clone() {
+            Some(p) => p,
+            None => {
+                self.show_toast("Save the document first to paste images");
+                return;
+            }
+        };
+        let parent = match path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return,
+        };
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "doc".to_string());
+        let assets_dir_name = format!("{stem}-assets");
+        let assets_dir = parent.join(&assets_dir_name);
+        if let Err(e) = fs::create_dir_all(&assets_dir) {
+            self.error_dialog("Couldn't save pasted image", &e.to_string());
+            return;
+        }
+        let stamp = glib::DateTime::now_local()
+            .ok()
+            .and_then(|d| d.format("%Y%m%d-%H%M%S").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "image".to_string());
+        let filename = format!("paste-{stamp}.png");
+        let img_path = assets_dir.join(&filename);
+        let png_bytes = texture.save_to_png_bytes();
+        if let Err(e) = fs::write(&img_path, png_bytes.as_ref()) {
+            self.error_dialog("Couldn't save pasted image", &e.to_string());
+            return;
+        }
+        let rel_path = format!("{assets_dir_name}/{filename}");
+        // URL-encode spaces / unusual chars so the path is safe inside
+        // markdown's `()`.
+        let encoded = glib::Uri::escape_string(&rel_path, Some("/-._~"), false).to_string();
+        let md_ref = format!("![]({encoded})");
+        self.inner.buffer.insert_at_cursor(&md_ref);
+        self.show_toast(&format!("Image saved: {rel_path}"));
+    }
+
+    // -- Image click in preview ------------------------------------------
+    // The IMAGE_CLICK_JS in the WebView posts a tab-delimited message
+    // (src\twidth\talt) when the user clicks an image. Open a small dialog
+    // to edit width / alt or remove the image; on apply we rewrite the
+    // markdown source in the buffer.
+    fn setup_image_click_handler(&self) {
+        let manager = self.inner.webview.user_content_manager();
+        let manager = match manager {
+            Some(m) => m,
+            None => return,
+        };
+        manager.register_script_message_handler("imageClick", None);
+        manager.register_script_message_handler("imageResize", None);
+        manager.register_script_message_handler("imageMove", None);
+
+        let st = self.clone();
+        manager.connect_script_message_received(Some("imageClick"), move |_, value| {
+            st.handle_image_click(&value.to_str());
+        });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("imageResize"), move |_, value| {
+            st.handle_image_resize(&value.to_str());
+        });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("imageMove"), move |_, value| {
+            st.handle_image_move(&value.to_str());
+        });
+    }
+
+    fn handle_image_click(&self, message: &str) {
+        let mut parts = message.splitn(3, '\t');
+        let src = parts.next().unwrap_or("").to_string();
+        let width = parts.next().unwrap_or("").to_string();
+        let alt = parts.next().unwrap_or("").to_string();
+        if src.is_empty() {
+            return;
+        }
+        self.show_image_options_dialog(&src, &width, &alt);
+    }
+
+    fn handle_image_resize(&self, message: &str) {
+        let mut parts = message.splitn(3, '\t');
+        let src = parts.next().unwrap_or("").to_string();
+        let width = parts.next().unwrap_or("").trim().to_string();
+        let alt = parts.next().unwrap_or("").to_string();
+        if src.is_empty() || width.is_empty() {
+            return;
+        }
+        self.apply_image_change(&src, Some(&width), &alt, false);
+    }
+
+    fn handle_image_move(&self, message: &str) {
+        let mut parts = message.splitn(2, '\t');
+        let src = parts.next().unwrap_or("").to_string();
+        let target_src = parts.next().unwrap_or("").to_string();
+        if src.is_empty() {
+            return;
+        }
+        self.move_image_before(&src, &target_src);
+    }
+
+    // Insert the dragged image immediately before another image
+    // (identified by its src) in the source. Empty `target_src` means
+    // "append at end". Always commits as a block-level paragraph, which
+    // means inline-image groups get split when the user drops between
+    // siblings — that's the only way markdown can express the new
+    // ordering cleanly.
+    fn move_image_before(&self, src: &str, target_src: &str) {
+        let buffer = &self.inner.buffer;
+        let refresh_after = self.inner.mode.borrow().as_str() == MODE_PREVIEW;
+
+        let (s_iter, e_iter) = buffer.bounds();
+        let text = buffer.text(&s_iter, &e_iter, true).to_string();
+        let Some((char_offset, char_len)) = find_image_ref(&text, src) else {
+            self.show_toast("Couldn't locate that image in the source");
+            if refresh_after {
+                self.refresh_preview();
+            }
+            return;
+        };
+        let bytes_start = char_to_byte_offset(&text, char_offset);
+        let bytes_end = char_to_byte_offset(&text, char_offset + char_len);
+        let image_expr = text[bytes_start..bytes_end].to_string();
+
+        buffer.begin_user_action();
+
+        // Delete the dragged image.
+        let mut s = buffer.iter_at_offset(char_offset as i32);
+        let mut e = buffer.iter_at_offset((char_offset + char_len) as i32);
+        buffer.delete(&mut s, &mut e);
+
+        // Compute the insertion point in the *modified* buffer.
+        let (s_iter, e_iter) = buffer.bounds();
+        let modified = buffer.text(&s_iter, &e_iter, true).to_string();
+
+        let insert_char_offset = if target_src.is_empty() {
+            modified.chars().count()
+        } else {
+            match find_image_ref(&modified, target_src) {
+                Some((c_off, _)) => c_off,
+                None => modified.chars().count(),
+            }
+        };
+
+        // Pad with newlines so the moved image always lands as its own
+        // paragraph. If we're splitting an inline image group, the
+        // siblings end up in separate paragraphs above and below.
+        let byte_idx = char_to_byte_offset(&modified, insert_char_offset);
+        let before = &modified[..byte_idx];
+        let after = &modified[byte_idx..];
+        let prefix = if before.is_empty() || before.ends_with("\n\n") {
+            String::new()
+        } else if before.ends_with('\n') {
+            "\n".to_string()
+        } else {
+            "\n\n".to_string()
+        };
+        let suffix = if after.is_empty() || after.starts_with("\n\n") {
+            String::new()
+        } else if after.starts_with('\n') {
+            "\n".to_string()
+        } else {
+            "\n\n".to_string()
+        };
+
+        let insertion = format!("{prefix}{image_expr}{suffix}");
+        let mut at = buffer.iter_at_offset(insert_char_offset as i32);
+        buffer.insert(&mut at, &insertion);
+
+        buffer.end_user_action();
+
+        if refresh_after {
+            self.refresh_preview();
+        }
+    }
+
+    fn show_image_options_dialog(&self, src: &str, current_width: &str, current_alt: &str) {
+        let dialog = adw::AlertDialog::builder().heading("Image options").build();
+        dialog.set_body(src);
+
+        // Form: alt + width inputs side by side.
+        let form = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        form.set_margin_top(8);
+
+        let alt_label = gtk::Label::new(Some("Alt text"));
+        alt_label.set_xalign(0.0);
+        let alt_entry = gtk::Entry::new();
+        alt_entry.set_text(current_alt);
+        alt_entry.set_hexpand(true);
+
+        let width_label = gtk::Label::new(Some("Width (px, blank for auto)"));
+        width_label.set_xalign(0.0);
+        let width_entry = gtk::Entry::new();
+        width_entry.set_text(current_width);
+        width_entry.set_max_length(8);
+
+        form.append(&alt_label);
+        form.append(&alt_entry);
+        form.append(&width_label);
+        form.append(&width_entry);
+        dialog.set_extra_child(Some(&form));
+
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("remove", "Remove");
+        dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+        dialog.add_response("apply", "Apply");
+        dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("apply"));
+        dialog.set_close_response("cancel");
+
+        let st = self.clone();
+        let src_owned = src.to_string();
+        dialog.connect_response(None, move |dlg, response| {
+            match response {
+                "apply" => {
+                    let new_alt = alt_entry.text().to_string();
+                    let raw_width = width_entry.text().to_string();
+                    let new_width = raw_width.trim();
+                    let new_width = if new_width.is_empty() {
+                        None
+                    } else {
+                        Some(new_width.to_string())
+                    };
+                    st.apply_image_change(&src_owned, new_width.as_deref(), &new_alt, false);
+                }
+                "remove" => {
+                    st.apply_image_change(&src_owned, None, "", true);
+                }
+                _ => {}
+            }
+            dlg.close();
+        });
+        dialog.present(Some(&self.inner.window));
+    }
+
+    fn apply_image_change(&self, src: &str, new_width: Option<&str>, new_alt: &str, remove: bool) {
+        let buffer = &self.inner.buffer;
+        let (start, end) = buffer.bounds();
+        let text = buffer.text(&start, &end, true).to_string();
+        let Some((char_start, char_len)) = find_image_ref(&text, src) else {
+            self.show_toast("Couldn't locate that image in the source");
+            return;
+        };
+        let replacement = if remove {
+            String::new()
+        } else {
+            build_image_markup(src, new_width, new_alt)
+        };
+        let mut s = buffer.iter_at_offset(char_start as i32);
+        let mut e = buffer.iter_at_offset((char_start + char_len) as i32);
+        buffer.delete(&mut s, &mut e);
+        if !replacement.is_empty() {
+            let mut at = buffer.iter_at_offset(char_start as i32);
+            buffer.insert(&mut at, &replacement);
+        }
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
     }
 
     fn setup_drag_and_drop(&self) {
@@ -2698,6 +3292,8 @@ fn ensure_state(app: &adw::Application) -> State {
         state.build_ui();
         state.wire_actions(app);
         state.setup_drag_and_drop();
+        state.setup_image_paste();
+        state.setup_image_click_handler();
         state.restore_window_state();
         // Empty doc opens in edit mode; loaded files later switch to preview.
         state.set_mode(MODE_EDIT, true);
