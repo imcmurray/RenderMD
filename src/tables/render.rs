@@ -19,7 +19,7 @@
 //! (e.g., raw `<table>` HTML blocks): cells in unknown tables get
 //! no attributes and are skipped over without breaking the scan.
 
-use super::model::MarkdownTable;
+use super::model::{Alignment, MarkdownTable};
 
 /// Inject `data-*` attributes on every `<th>`/`<td>` belonging to a
 /// table that the parser recognised. Other HTML passes through
@@ -102,9 +102,15 @@ pub fn inject_table_attrs(html: &str, tables: &[MarkdownTable]) -> String {
                 if let Some(raw_md) = raw {
                     let raw_encoded = percent_encode(raw_md);
                     let row_attr = if in_head { -1 } else { row_idx };
+                    let align_attr = match table.alignments.get(col_idx).copied() {
+                        Some(Alignment::Left) => "left",
+                        Some(Alignment::Center) => "center",
+                        Some(Alignment::Right) => "right",
+                        _ => "none",
+                    };
                     let attrs = format!(
-                        r#" class="rmd-cell" data-table-id="{}" data-row="{}" data-col="{}" data-raw="{}""#,
-                        table.id, row_attr, col_idx, raw_encoded
+                        r#" class="rmd-cell" data-table-id="{}" data-row="{}" data-col="{}" data-align="{}" data-raw="{}""#,
+                        table.id, row_attr, col_idx, align_attr, raw_encoded
                     );
                     // Inject just before the closing `>`. Defensive against
                     // self-closing `<th/>` even though comrak doesn't emit them.
@@ -322,7 +328,7 @@ pub const TABLE_EDIT_JS: &str = r#"
     toolbar = document.createElement("div");
     toolbar.className = "rmd-table-toolbar";
     toolbar.style.display = "none";
-    var specs = [
+    var structural = [
       ["row-above", "↱ Row", "Insert row above (Ctrl+Shift+↑)"],
       ["row-below", "↵ Row", "Insert row below (Ctrl+Shift+↓)"],
       ["col-left", "↰ Col", "Insert column left (Ctrl+Shift+←)"],
@@ -330,29 +336,72 @@ pub const TABLE_EDIT_JS: &str = r#"
       ["row-delete", "− Row", "Delete row (Ctrl+Shift+-)"],
       ["col-delete", "− Col", "Delete column (Ctrl+Alt+-)"],
     ];
-    specs.forEach(function(s) {
-      var btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "rmd-table-toolbar-btn";
-      btn.setAttribute("data-action", s[0]);
-      btn.textContent = s[1];
-      btn.title = s[2];
-      // Stop mousedown from stealing focus from the editable cell.
-      btn.addEventListener("mousedown", function(e) { e.preventDefault(); });
-      btn.addEventListener("click", function(e) {
-        e.preventDefault();
-        e.stopPropagation();
-        dispatchStructureOp(s[0]);
-      });
-      toolbar.appendChild(btn);
+    structural.forEach(function(s) {
+      addToolbarButton(s[0], s[1], s[2], false);
+    });
+    // Separator between structural and alignment clusters; only
+    // visible when the alignment buttons are shown (header cell).
+    var sep = document.createElement("div");
+    sep.className = "rmd-table-toolbar-sep";
+    toolbar.appendChild(sep);
+    var align = [
+      ["align-left", "L", "Left-align column"],
+      ["align-center", "C", "Center-align column"],
+      ["align-right", "R", "Right-align column"],
+    ];
+    align.forEach(function(s) {
+      addToolbarButton(s[0], s[1], s[2], true);
     });
     document.body.appendChild(toolbar);
     return toolbar;
   }
+  function addToolbarButton(action, label, title, isAlign) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "rmd-table-toolbar-btn" + (isAlign ? " rmd-table-toolbar-align" : "");
+    btn.setAttribute("data-action", action);
+    btn.textContent = label;
+    btn.title = title;
+    // Stop mousedown from stealing focus from the editable cell —
+    // otherwise the cell blurs (and commits) before our click runs.
+    btn.addEventListener("mousedown", function(e) { e.preventDefault(); });
+    btn.addEventListener("click", function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!active) return;
+      // Toggle: clicking the already-active alignment reverts to none.
+      var resolvedOp = action;
+      if (isAlign && btn.classList.contains("rmd-table-toolbar-active")) {
+        resolvedOp = "align-none";
+      }
+      dispatchStructureOp(resolvedOp);
+    });
+    toolbar.appendChild(btn);
+  }
   function showToolbarForCell(cell) {
     var tb = buildToolbar();
     tb.style.display = "flex";
-    // Render once to measure, then position relative to the cell.
+
+    // Alignment buttons + separator only show when a HEADER cell is
+    // active. The model's alignment lives per-column; we wouldn't
+    // know which column to retarget if a body cell were the source.
+    var isHeader = cell.getAttribute("data-row") === "-1";
+    tb.querySelectorAll(".rmd-table-toolbar-align, .rmd-table-toolbar-sep")
+      .forEach(function(el) {
+        el.style.display = isHeader ? "" : "none";
+      });
+
+    // Highlight the alignment button matching the column's current
+    // setting (or none, if the column has no explicit alignment).
+    if (isHeader) {
+      var currentAlign = cell.getAttribute("data-align") || "none";
+      tb.querySelectorAll(".rmd-table-toolbar-align").forEach(function(b) {
+        var op = b.getAttribute("data-action").slice("align-".length);
+        b.classList.toggle("rmd-table-toolbar-active", op === currentAlign);
+      });
+    }
+
+    // Measure after the show/hide so the rect is final.
     var cellRect = cell.getBoundingClientRect();
     var tbRect = tb.getBoundingClientRect();
     var top = Math.max(8, cellRect.top - tbRect.height - 6);
@@ -537,6 +586,27 @@ mod tests {
         // output, no data-table-id="2".
         assert!(!out.contains(r#"data-table-id="2""#));
         assert!(out.contains("<td>raw</td>"));
+    }
+
+    #[test]
+    fn injection_emits_data_align_from_separator_alignment() {
+        let src = "| a | b | c |\n|:--|:-:|--:|\n| 1 | 2 | 3 |\n";
+        let tables = parse_tables(src);
+        let html = "<table><thead><tr><th>a</th><th>b</th><th>c</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td></tr></tbody></table>";
+        let out = inject_table_attrs(html, &tables);
+        assert!(out.contains(r#"data-align="left""#), "got: {out}");
+        assert!(out.contains(r#"data-align="center""#));
+        assert!(out.contains(r#"data-align="right""#));
+    }
+
+    #[test]
+    fn injection_defaults_data_align_to_none() {
+        let src = "| a |\n|---|\n| 1 |\n";
+        let tables = parse_tables(src);
+        let html =
+            "<table><thead><tr><th>a</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>";
+        let out = inject_table_attrs(html, &tables);
+        assert!(out.contains(r#"data-align="none""#));
     }
 
     #[test]

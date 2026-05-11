@@ -296,6 +296,21 @@ img {
   background: rgba(127, 127, 127, 0.14);
   color: var(--accent);
 }
+.rmd-table-toolbar-btn.rmd-table-toolbar-active {
+  background: var(--accent);
+  color: var(--bg);
+}
+.rmd-table-toolbar-btn.rmd-table-toolbar-active:hover {
+  background: var(--accent);
+  color: var(--bg);
+  filter: brightness(1.1);
+}
+.rmd-table-toolbar-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+  margin: 2px 4px;
+}
 .rmd-history-rail {
   position: fixed;
   left: 8px;
@@ -2824,6 +2839,18 @@ impl State {
                 table.delete_row(body_row, &mut shadow)
             }
             "col-delete" => table.delete_column(col, &mut shadow),
+            "align-left" => {
+                table.set_column_alignment(col, tables::model::Alignment::Left, &mut shadow)
+            }
+            "align-center" => {
+                table.set_column_alignment(col, tables::model::Alignment::Center, &mut shadow)
+            }
+            "align-right" => {
+                table.set_column_alignment(col, tables::model::Alignment::Right, &mut shadow)
+            }
+            "align-none" => {
+                table.set_column_alignment(col, tables::model::Alignment::None, &mut shadow)
+            }
             _ => return,
         };
 
@@ -2834,6 +2861,13 @@ impl State {
                 return;
             }
         };
+
+        // `set_column_alignment` signals a no-op (clicking the
+        // already-active alignment) with an empty patched_range —
+        // skip the buffer patch and the refresh entirely.
+        if delta.patched_range.is_empty() && delta.byte_delta == 0 {
+            return;
+        }
 
         self.apply_buffer_patch(&buffer_text, &shadow, &delta);
 
@@ -2866,6 +2900,11 @@ impl State {
                     let new_col = col.min(n_cols - 1);
                     Some((row, new_col))
                 }
+            }
+            "align-left" | "align-center" | "align-right" | "align-none" => {
+                // Alignment doesn't change cell positions — stay on the
+                // header cell the user clicked.
+                Some((row, col))
             }
             _ => None,
         };

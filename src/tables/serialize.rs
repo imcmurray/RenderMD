@@ -233,6 +233,34 @@ pub fn insert_column(
     re_serialize_structurally(table, buffer)
 }
 
+/// Set the column's alignment, rewriting the separator row so the
+/// new colons land in the right place. A no-op (same alignment as
+/// the current value) returns an `EditDelta` with an empty
+/// `patched_range` so the caller can short-circuit without
+/// touching the buffer.
+pub fn set_column_alignment(
+    table: &mut MarkdownTable,
+    col: usize,
+    alignment: Alignment,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    if col >= table.alignments.len() {
+        return Err(TableError::CellOutOfRange { row: -1, col });
+    }
+    if table.alignments[col] == alignment {
+        // No-op: caller will see is_empty()==true on patched_range
+        // and skip the buffer patch and refresh.
+        let pin = table.source_range.start..table.source_range.start;
+        return Ok(EditDelta {
+            byte_delta: 0,
+            patched_range: pin.clone(),
+            new_range: pin,
+        });
+    }
+    table.alignments[col] = alignment;
+    re_serialize_structurally(table, buffer)
+}
+
 /// Remove the column at `col_index` from header, alignments,
 /// column_widths, and every body row that has a cell at that index.
 /// Refuses to remove the last column (would leave an invalid table).
@@ -967,6 +995,80 @@ mod tests {
         // original_lines re-captured against the new source.
         assert!(t.original_lines.is_some());
         // Per-cell edit still works in PreserveOriginal mode.
+        t.update_cell(0, 0, "Bob", &mut buffer).unwrap();
+        assert!(buffer.contains("Bob"));
+    }
+
+    #[test]
+    fn set_column_alignment_updates_alignments() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.set_column_alignment(1, Alignment::Center, &mut buffer)
+            .unwrap();
+        assert_eq!(t.alignments[1], Alignment::Center);
+        assert!(buffer.contains(":-:") || buffer.contains(":---:"));
+    }
+
+    #[test]
+    fn set_column_alignment_renders_left_separator() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.set_column_alignment(0, Alignment::Left, &mut buffer)
+            .unwrap();
+        assert!(buffer.contains(":-"), "buffer: {buffer}");
+    }
+
+    #[test]
+    fn set_column_alignment_renders_right_separator() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.set_column_alignment(0, Alignment::Right, &mut buffer)
+            .unwrap();
+        assert!(buffer.contains("-:"), "buffer: {buffer}");
+    }
+
+    #[test]
+    fn set_column_alignment_no_op_returns_empty_range() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let buffer_before = buffer.clone();
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        // Column already has Alignment::None.
+        let delta = t
+            .set_column_alignment(0, Alignment::None, &mut buffer)
+            .unwrap();
+        assert!(delta.patched_range.is_empty());
+        assert_eq!(delta.byte_delta, 0);
+        // Buffer untouched.
+        assert_eq!(buffer, buffer_before);
+    }
+
+    #[test]
+    fn set_column_alignment_out_of_range_errors() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        let err = t
+            .set_column_alignment(5, Alignment::Center, &mut buffer)
+            .unwrap_err();
+        assert!(matches!(err, TableError::CellOutOfRange { .. }));
+    }
+
+    #[test]
+    fn set_column_alignment_preserves_preserve_original_style() {
+        let original = "| name  | score |\n|-------|-------|\n| Alice |    42 |\n";
+        let mut buffer = String::from(original);
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        t.set_column_alignment(1, Alignment::Right, &mut buffer)
+            .unwrap();
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        assert!(t.original_lines.is_some());
+        // Subsequent per-cell edits still patch in place.
         t.update_cell(0, 0, "Bob", &mut buffer).unwrap();
         assert!(buffer.contains("Bob"));
     }

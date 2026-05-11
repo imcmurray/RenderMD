@@ -287,6 +287,18 @@ impl MarkdownTable {
         crate::tables::serialize::delete_column(self, col_index, buffer)
     }
 
+    /// Set a column's alignment. Idempotent — calling with the
+    /// column's current alignment returns an empty-range EditDelta
+    /// so the caller can skip the buffer patch.
+    pub fn set_column_alignment(
+        &mut self,
+        col: usize,
+        alignment: Alignment,
+        buffer: &mut String,
+    ) -> Result<EditDelta> {
+        crate::tables::serialize::set_column_alignment(self, col, alignment, buffer)
+    }
+
     /// Compute the navigation target for a Tab / Shift+Tab / Enter
     /// / Shift+Enter press inside the cell at `(row, col)`.
     ///
