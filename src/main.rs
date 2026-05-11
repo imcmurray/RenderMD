@@ -2505,12 +2505,123 @@ impl State {
         let clipboard_for_fallback = clipboard.clone();
         clipboard.read_texture_async(None::<&gio::Cancellable>, move |result| match result {
             Ok(Some(texture)) => st.paste_image_to_buffer(&texture),
-            _ => {
-                st.inner
-                    .buffer
-                    .paste_clipboard(&clipboard_for_fallback, None, true);
-            }
+            _ => st.try_paste_table_or_text(clipboard_for_fallback),
         });
+    }
+
+    /// After an image read returns nothing, peek at the clipboard's
+    /// text. If it looks like tabular data (TSV / CSV / existing GFM
+    /// table), convert and insert as a clean GFM table — otherwise
+    /// fall through to the buffer's normal text paste.
+    ///
+    /// Shift+Ctrl+V (the GTK "paste as plain text" shortcut) bypasses
+    /// this handler entirely, so users always have an escape hatch.
+    fn try_paste_table_or_text(&self, clipboard: gdk::Clipboard) {
+        let st = self.clone();
+        let cb_for_paste = clipboard.clone();
+        clipboard.read_text_async(None::<&gio::Cancellable>, move |result| {
+            let text = result.ok().flatten().map(|s| s.to_string());
+            if let Some(text) = text.as_deref() {
+                if st.try_paste_table(text) {
+                    return;
+                }
+            }
+            // Not table-shaped → fall back to GTK's text paste path,
+            // which respects the user's editing context exactly as
+            // before (cursor, selection, undo grouping).
+            st.inner.buffer.paste_clipboard(&cb_for_paste, None, true);
+        });
+    }
+
+    /// Detect, convert, and insert a clipboard payload as a GFM table.
+    /// Returns true if smart-paste handled the content, false to let
+    /// the caller fall back to normal text paste.
+    fn try_paste_table(&self, text: &str) -> bool {
+        let detected = tables::detect_table_paste(Some(text), None);
+        if matches!(detected, tables::TablePaste::None) {
+            return false;
+        }
+        let Some(md) = tables::paste_to_gfm(&detected, tables::TableStyle::Pretty) else {
+            return false;
+        };
+        let (rows, cols) = match detected.shape() {
+            Some(s) => s,
+            None => return false,
+        };
+        let origin_label = match detected {
+            tables::TablePaste::Tsv { .. } => "TSV",
+            tables::TablePaste::Csv { .. } => "CSV",
+            tables::TablePaste::Gfm { .. } => "Markdown",
+            tables::TablePaste::Html { .. } => "HTML table",
+            tables::TablePaste::None => return false,
+        };
+        self.insert_table_at_cursor(&md);
+        // Body cells excluding header for the user-facing count.
+        let body_rows = rows.saturating_sub(1);
+        self.show_toast(&format!(
+            "Pasted as table ({body_rows}×{cols} from {origin_label}) — Ctrl+Z to undo"
+        ));
+        true
+    }
+
+    /// Insert a freshly converted GFM table at the cursor with proper
+    /// blank-line padding. Wraps the insert in a single user-action so
+    /// Ctrl+Z reverts the entire paste in one step.
+    fn insert_table_at_cursor(&self, md: &str) {
+        let buf = &self.inner.buffer;
+        let mark = buf.mark("insert").or_else(|| Some(buf.get_insert()));
+        let Some(mark) = mark else {
+            return;
+        };
+        let iter = buf.iter_at_mark(&mark);
+
+        // Determine how much leading whitespace to add. Goal: the
+        // table always lands on its own line with a blank line above
+        // (so GFM parses it as a block) — but don't add extra blank
+        // lines if the cursor is already at the start of a blank line.
+        let at_line_start = iter.line_offset() == 0;
+        let at_doc_start = iter.offset() == 0;
+        let prev_line_blank = if at_line_start && !at_doc_start {
+            // Look at the immediately-preceding line.
+            let mut probe = iter;
+            probe.backward_char(); // step into the previous newline
+            probe.set_line_offset(0);
+            let mut end_of_prev = probe;
+            end_of_prev.forward_to_line_end();
+            buf.text(&probe, &end_of_prev, false).trim().is_empty()
+        } else {
+            // Pretend doc start counts as "blank prev line" — no extra
+            // padding needed when we're at the very top.
+            at_doc_start
+        };
+
+        let mut prefix = String::new();
+        if !at_line_start {
+            prefix.push('\n'); // break out of the current line
+            prefix.push('\n'); // blank separator
+        } else if !prev_line_blank {
+            prefix.push('\n'); // blank separator above
+        }
+
+        let mut insertion = prefix;
+        insertion.push_str(md.trim_end_matches('\n'));
+        insertion.push('\n');
+        insertion.push('\n'); // trailing blank line so following content stays a block
+
+        self.inner.suppress_modify.set(true);
+        buf.begin_user_action();
+        let mut iter = buf.iter_at_mark(&mark);
+        buf.insert(&mut iter, &insertion);
+        buf.end_user_action();
+        self.inner.suppress_modify.set(false);
+
+        if !self.inner.is_modified.get() {
+            self.inner.is_modified.set(true);
+            self.update_title();
+        }
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
     }
 
     fn paste_image_to_buffer(&self, texture: &gdk::Texture) {
