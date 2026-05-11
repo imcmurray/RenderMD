@@ -2180,6 +2180,15 @@ struct StateInner {
     toggle_btn: gtk::ToggleButton,
     toggle_icon: gtk::Image,
     toggle_label: gtk::Label,
+    // Custom AdwWindowTitle in the header bar. We control title +
+    // subtitle directly so the modified-state indicator (●) can live
+    // in the subtitle slot instead of the window title. Reason: on
+    // Budgie + Wayland the compositor mirrors the window title back
+    // into a strip above the AdwHeaderBar while the window is
+    // focused; characters with tall baselines bleed into the visible
+    // area as ghost marks. Keeping ● out of the window title avoids
+    // that mirror entirely.
+    title_widget: adw::WindowTitle,
     status_path: gtk::Label,
     status_mtime: gtk::Label,
     status_mode: gtk::Label,
@@ -2252,6 +2261,7 @@ impl State {
         let toggle_btn = gtk::ToggleButton::new();
         let toggle_icon = gtk::Image::from_icon_name("document-edit-symbolic");
         let toggle_label = gtk::Label::new(Some("Edit"));
+        let title_widget = adw::WindowTitle::new(APP_NAME, "");
         let status_path = gtk::Label::new(None);
         let status_mtime = gtk::Label::new(None);
         let status_mode = gtk::Label::new(None);
@@ -2266,6 +2276,7 @@ impl State {
             toggle_btn,
             toggle_icon,
             toggle_label,
+            title_widget,
             status_path,
             status_mtime,
             status_mode,
@@ -2300,6 +2311,7 @@ impl State {
 
         // HeaderBar
         let header = adw::HeaderBar::new();
+        header.set_title_widget(Some(&s.title_widget));
         toolbar_view.add_top_bar(&header);
 
         // Left side: New / Open / Save
@@ -4411,14 +4423,33 @@ impl State {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled".to_string());
-        let prefix = if self.inner.is_modified.get() {
-            "\u{2022} "
-        } else {
-            ""
-        };
+        let modified = self.inner.is_modified.get();
+        // Two distinct title surfaces:
+        //
+        // 1. OS-level window title — left empty intentionally.
+        //    Some compositors (notably Budgie on Wayland) mirror the
+        //    Wayland-set window title back into a strip *above* the
+        //    AdwHeaderBar while the window has keyboard focus. When
+        //    the strip's font differs from the headerbar's, character
+        //    bottoms bleed down past the strip edge and appear as
+        //    "ghost marks" above the visible title. Empty window
+        //    title → nothing to mirror → no marks. The trade-off is
+        //    that taskbar / alt-tab entries lose per-file text, which
+        //    we judge acceptable for the cleaner visible title.
+        //
+        // 2. HeaderBar title — driven through an explicit
+        //    AdwWindowTitle so we can route the modified-state
+        //    indicator into the subtitle slot below the title (in
+        //    smaller font) rather than prefixing it onto the main
+        //    title. This keeps the modified marker visually
+        //    distinguishable without growing the main title.
+        self.inner.window.set_title(Some(""));
         self.inner
-            .window
-            .set_title(Some(&format!("{}{} \u{2014} {}", prefix, name, APP_NAME)));
+            .title_widget
+            .set_title(&format!("{} \u{2014} {}", name, APP_NAME));
+        self.inner
+            .title_widget
+            .set_subtitle(if modified { "\u{25CF} Modified" } else { "" });
         match current {
             Some(p) => {
                 self.inner.status_path.set_text(&p.to_string_lossy());
