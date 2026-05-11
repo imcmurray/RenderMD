@@ -148,10 +148,8 @@ fn collect_table(
                 in_head = false;
             }
             Event::Start(Tag::TableRow) => current_row.clear(),
-            Event::End(TagEnd::TableRow) => {
-                if !in_head {
-                    rows.push(std::mem::take(&mut current_row));
-                }
+            Event::End(TagEnd::TableRow) if !in_head => {
+                rows.push(std::mem::take(&mut current_row));
             }
             Event::Start(Tag::TableCell) => {
                 current_cell_start = Some(r.start);
