@@ -233,6 +233,19 @@ pub fn insert_column(
     re_serialize_structurally(table, buffer)
 }
 
+/// Replace the table's body rows wholesale and trigger a structural
+/// re-serialize. Used by the sort flow to commit a freshly reordered
+/// rows vector; same PreserveOriginal-aware handling as the other
+/// structural ops.
+pub fn replace_rows(
+    table: &mut MarkdownTable,
+    new_rows: Vec<Vec<Cell>>,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    table.rows = new_rows;
+    re_serialize_structurally(table, buffer)
+}
+
 /// Force-reformat the table to pretty-aligned columns, recomputing
 /// widths from the current cell contents. Works on tables of any
 /// style — PreserveOriginal, Pretty, or Compact — and **leaves the
@@ -1130,6 +1143,7 @@ mod tests {
             column_widths: vec![],
             formulas: Default::default(),
             original_lines: None,
+            sort_indicator: None,
         };
         let mut buf = String::new();
         let err = table.reformat_pretty(&mut buf).unwrap_err();

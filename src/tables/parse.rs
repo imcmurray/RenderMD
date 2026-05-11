@@ -122,6 +122,7 @@ fn collect_table(
         column_widths: vec![None; n_cols],
         formulas: HashMap::new(),
         original_lines,
+        sort_indicator: None,
     };
     (table, i)
 }

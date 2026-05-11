@@ -1149,6 +1149,18 @@ struct HistorySnapshot {
     commit_unix_secs: i64,
 }
 
+/// Per-table sort state held on the application (one entry per
+/// currently-sorted table). The snapshot is the *pre-sort* row vector
+/// so the tri-state cycle's "Off" can restore the original order.
+/// Cleared by any edit that changes the row set (cell content change,
+/// row/column insert/delete).
+#[derive(Clone, Debug)]
+struct TableSortSnapshot {
+    original_rows: Vec<Vec<tables::model::Cell>>,
+    col: usize,
+    direction: tables::model::SortDirection,
+}
+
 // Run `git log --follow` for the file and return the commit list, newest
 // first. Returns None if git isn't installed, the file isn't in a repo,
 // the file isn't tracked, or git errored. Capped at 100 commits to keep
@@ -2163,6 +2175,16 @@ struct StateInner {
     // (programmatically click) once the new HTML loads, so Tab/Enter
     // navigation between cells feels continuous to the user.
     pending_focus_cell: RefCell<Option<(tables::TableId, i32, usize)>>,
+
+    // Per-table sort state — stores the snapshot of pre-sort rows
+    // plus the current (col, direction). Consulted by:
+    //   - `handle_table_sort` for the tri-state cycle (Off restores
+    //     from the snapshot)
+    //   - `refresh_preview` to hydrate `sort_indicator` on each
+    //     parsed MarkdownTable so the post-processor emits
+    //     `data-sort-dir` on the active header cell
+    // Cleared when a structural / cell edit invalidates the snapshot.
+    table_sort_snapshots: RefCell<HashMap<tables::TableId, TableSortSnapshot>>,
     toggle_handler: RefCell<Option<glib::SignalHandlerId>>,
     buffer_handler: RefCell<Option<glib::SignalHandlerId>>,
 
@@ -2223,6 +2245,7 @@ impl State {
             viewing_snapshot: RefCell::new(None),
             history_visible: Cell::new(true),
             pending_focus_cell: RefCell::new(None),
+            table_sort_snapshots: RefCell::new(HashMap::new()),
             toggle_handler: RefCell::new(None),
             buffer_handler: RefCell::new(None),
             watcher: RefCell::new(None),
@@ -2737,6 +2760,7 @@ impl State {
         manager.register_script_message_handler("tableEdit", None);
         manager.register_script_message_handler("tableNavigate", None);
         manager.register_script_message_handler("tableStructure", None);
+        manager.register_script_message_handler("tableSort", None);
 
         let st = self.clone();
         manager.connect_script_message_received(Some("imageClick"), move |_, value| {
@@ -2770,6 +2794,129 @@ impl State {
         manager.connect_script_message_received(Some("tableStructure"), move |_, value| {
             st.handle_table_structure(&value.to_str());
         });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("tableSort"), move |_, value| {
+            st.handle_table_sort(&value.to_str());
+        });
+    }
+
+    /// Apply a sort operation triggered by the toolbar's tri-state
+    /// sort button.
+    ///
+    /// Payload is `table_id\tcol\tdirection` where `direction` is
+    /// `asc` | `desc` | `off`. (Row is unused — sort is per-column.)
+    ///
+    /// Snapshot lifecycle:
+    ///   - First Asc/Desc click on a previously-unsorted table:
+    ///     snapshot current rows into `table_sort_snapshots`, then
+    ///     sort.
+    ///   - Subsequent Asc/Desc clicks on the same table: re-sort
+    ///     from the snapshot (so Desc isn't just "reverse of Asc" —
+    ///     it's a Desc sort of the original, stable for ties).
+    ///   - Off: restore from snapshot and remove the entry. If the
+    ///     snapshot was invalidated by an intervening edit, Off is
+    ///     a no-op with an informational toast.
+    fn handle_table_sort(&self, message: &str) {
+        let mut parts = message.splitn(3, '\t');
+        let table_id: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let col: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let dir_str = parts.next().unwrap_or("");
+        if table_id == 0 {
+            return;
+        }
+        let direction = match dir_str {
+            "asc" => tables::model::SortDirection::Ascending,
+            "desc" => tables::model::SortDirection::Descending,
+            "off" => tables::model::SortDirection::None,
+            _ => return,
+        };
+
+        let buffer_text = self.buffer_text();
+        let mut tables_vec = tables::parse_tables(&buffer_text);
+        let table = match tables_vec.iter_mut().find(|t| t.id == table_id) {
+            Some(t) => t,
+            None => {
+                self.show_toast("Couldn't locate that table — refreshing");
+                if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                    self.refresh_preview();
+                }
+                return;
+            }
+        };
+        if col >= table.alignments.len() {
+            self.show_toast("Column out of range for sort");
+            return;
+        }
+
+        let new_rows: Vec<Vec<tables::model::Cell>> = match direction {
+            tables::model::SortDirection::None => {
+                let mut snapshots = self.inner.table_sort_snapshots.borrow_mut();
+                match snapshots.remove(&table_id) {
+                    Some(snap) => {
+                        self.show_toast(&format!(
+                            "Sort cleared — column {} restored to original order",
+                            snap.col + 1
+                        ));
+                        snap.original_rows
+                    }
+                    None => {
+                        // No snapshot — either Off was clicked without a
+                        // prior sort, or an intervening edit invalidated
+                        // the snapshot.
+                        self.show_toast(
+                            "Original row order not tracked (cleared by a recent edit)",
+                        );
+                        return;
+                    }
+                }
+            }
+            tables::model::SortDirection::Ascending | tables::model::SortDirection::Descending => {
+                // Use the existing snapshot's rows as the baseline if
+                // we already have one (so Desc is always "desc of
+                // original" rather than "reverse of asc"). Otherwise,
+                // snapshot the current rows.
+                let baseline = {
+                    let snapshots = self.inner.table_sort_snapshots.borrow();
+                    snapshots
+                        .get(&table_id)
+                        .map(|s| s.original_rows.clone())
+                        .unwrap_or_else(|| table.rows.clone())
+                };
+                let sorted = tables::model::sort_rows(baseline.clone(), col, direction);
+                self.inner.table_sort_snapshots.borrow_mut().insert(
+                    table_id,
+                    TableSortSnapshot {
+                        original_rows: baseline,
+                        col,
+                        direction,
+                    },
+                );
+                let dir_label = if matches!(direction, tables::model::SortDirection::Ascending) {
+                    "ascending"
+                } else {
+                    "descending"
+                };
+                self.show_toast(&format!("Sorted by column {} ({})", col + 1, dir_label));
+                sorted
+            }
+        };
+
+        let mut shadow = buffer_text.clone();
+        let delta = match table.replace_rows(new_rows, &mut shadow) {
+            Ok(d) => d,
+            Err(e) => {
+                self.show_toast(&format!("Sort failed: {e}"));
+                return;
+            }
+        };
+        self.apply_buffer_patch(&buffer_text, &shadow, &delta);
+
+        // Stay on the header cell the user clicked.
+        *self.inner.pending_focus_cell.borrow_mut() = Some((table_id, -1, col));
+
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
     }
 
     /// Apply a structural edit (insert/delete row, insert/delete
@@ -2814,6 +2961,19 @@ impl State {
         // we refuse — the header isn't a "row" the user can insert
         // above. row-delete on the header is also refused.
         let body_row = row.max(0) as usize;
+        // Row/column structural ops change the row set; alignment +
+        // reformat leave row order intact. Invalidate the sort
+        // snapshot only for the former — otherwise "Off" should
+        // still work after an alignment tweak.
+        if matches!(
+            op,
+            "row-above" | "row-below" | "col-left" | "col-right" | "row-delete" | "col-delete"
+        ) {
+            self.inner
+                .table_sort_snapshots
+                .borrow_mut()
+                .remove(&table_id);
+        }
         let mut shadow = buffer_text.clone();
         let result = match op {
             "row-above" => {
@@ -3048,6 +3208,13 @@ impl State {
         if table_id == 0 {
             return;
         }
+        // A cell-content change invalidates any pre-sort snapshot
+        // for this table — restoring the original order would
+        // silently drop the user's edit.
+        self.inner
+            .table_sort_snapshots
+            .borrow_mut()
+            .remove(&table_id);
 
         let buffer_text = self.buffer_text();
         let mut tables = tables::parse_tables(&buffer_text);
@@ -3472,7 +3639,18 @@ impl State {
         // rendered HTML to inject data-* attributes + the click-to-
         // edit JS so cells become interactive in the live preview.
         // No-op when the doc has no tables.
-        let parsed_tables = tables::parse_tables(&text);
+        let mut parsed_tables = tables::parse_tables(&text);
+        // Hydrate transient sort indicators from the per-document
+        // snapshot map so the post-processor can emit data-sort-dir
+        // on the active header cell.
+        {
+            let snapshots = self.inner.table_sort_snapshots.borrow();
+            for t in &mut parsed_tables {
+                if let Some(snap) = snapshots.get(&t.id) {
+                    t.sort_indicator = Some((snap.col, snap.direction));
+                }
+            }
+        }
         let html_with_tables = if parsed_tables.is_empty() {
             html
         } else {

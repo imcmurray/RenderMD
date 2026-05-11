@@ -56,6 +56,14 @@ pub struct MarkdownTable {
     ///
     /// [`update_cell`]: MarkdownTable::update_cell
     pub original_lines: Option<Vec<OriginalLine>>,
+
+    /// Transient: which column is currently sorted and in what
+    /// direction. Hydrated by callers from per-document sort state
+    /// (typically a `HashMap<TableId, ...>` on the host application)
+    /// after `parse_tables`; consumed by the render post-processor
+    /// to emit `data-sort-dir` on the active header cell so the
+    /// frontend can show the tri-state indicator on the toolbar.
+    pub sort_indicator: Option<(usize, SortDirection)>,
 }
 
 /// A single table cell.
@@ -132,6 +140,94 @@ pub struct EditDelta {
     pub patched_range: Range<usize>,
     /// The new buffer range covering the same logical cell.
     pub new_range: Range<usize>,
+}
+
+/// Sort direction for [`sort_rows`] and the `Sort` toolbar control.
+///
+/// The toolbar cycles `None → Ascending → Descending → None`. Backend
+/// behaviour:
+///
+///   - `Ascending` / `Descending`: re-orders rows in place. The caller
+///     keeps a snapshot of the pre-sort rows so a subsequent `None`
+///     click can restore the original order.
+///   - `None`: signals the caller should restore from its snapshot.
+///     `sort_rows` itself just returns the rows unchanged in this case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDirection {
+    None,
+    Ascending,
+    Descending,
+}
+
+/// Sort `rows` by the content of `col`, returning a freshly ordered
+/// `Vec`. Smart numeric/text detection per column:
+///
+///   - If every non-empty cell in `col` parses as `f64`, the column
+///     is treated as numeric and sorted by numeric value (so `"10"`
+///     sorts after `"2"`).
+///   - Otherwise: case-insensitive lexicographic comparison.
+///
+/// Empty cells go to the end regardless of direction. Sort is stable
+/// (preserves the relative order of equal values). `SortDirection::None`
+/// returns `rows` unchanged.
+pub fn sort_rows(rows: Vec<Vec<Cell>>, col: usize, direction: SortDirection) -> Vec<Vec<Cell>> {
+    if matches!(direction, SortDirection::None) {
+        return rows;
+    }
+    let numeric = is_numeric_column(&rows, col);
+    let mut out = rows;
+    out.sort_by(|a, b| compare_rows(a, b, col, numeric, direction));
+    out
+}
+
+/// `true` when at least one non-empty cell exists in `col` *and* every
+/// non-empty cell parses as `f64`. Empty cells are skipped — they
+/// don't drag the column into "text" mode.
+pub fn is_numeric_column(rows: &[Vec<Cell>], col: usize) -> bool {
+    let mut any = false;
+    for row in rows {
+        let content = row.get(col).map(|c| c.content.as_str()).unwrap_or("");
+        if content.trim().is_empty() {
+            continue;
+        }
+        if content.trim().parse::<f64>().is_err() {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
+fn compare_rows(
+    a: &[Cell],
+    b: &[Cell],
+    col: usize,
+    numeric: bool,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let a_content = a.get(col).map(|c| c.content.as_str()).unwrap_or("").trim();
+    let b_content = b.get(col).map(|c| c.content.as_str()).unwrap_or("").trim();
+
+    // Empties go to the end regardless of direction.
+    match (a_content.is_empty(), b_content.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        _ => {}
+    }
+
+    let base = if numeric {
+        let an: f64 = a_content.parse().unwrap_or(0.0);
+        let bn: f64 = b_content.parse().unwrap_or(0.0);
+        an.partial_cmp(&bn).unwrap_or(Ordering::Equal)
+    } else {
+        a_content.to_lowercase().cmp(&b_content.to_lowercase())
+    };
+    match direction {
+        SortDirection::Descending => base.reverse(),
+        _ => base,
+    }
 }
 
 /// Direction for [`MarkdownTable::navigate`].
@@ -306,6 +402,17 @@ impl MarkdownTable {
     /// [`crate::tables::serialize::reformat_pretty`] for details.
     pub fn reformat_pretty(&mut self, buffer: &mut String) -> Result<EditDelta> {
         crate::tables::serialize::reformat_pretty(self, buffer)
+    }
+
+    /// Replace the table's body rows wholesale (used by the sort
+    /// flow, which computes the new order outside the model and
+    /// commits it here as one structural operation).
+    pub fn replace_rows(
+        &mut self,
+        new_rows: Vec<Vec<Cell>>,
+        buffer: &mut String,
+    ) -> Result<EditDelta> {
+        crate::tables::serialize::replace_rows(self, new_rows, buffer)
     }
 
     /// Compute the navigation target for a Tab / Shift+Tab / Enter
@@ -489,6 +596,7 @@ mod tests {
             column_widths: vec![None, None],
             formulas: HashMap::new(),
             original_lines: None,
+            sort_indicator: None,
         }
     }
 
@@ -646,6 +754,123 @@ mod tests {
                 created_row: true
             }
         );
+    }
+
+    fn rows_with(values: &[&[&str]]) -> Vec<Vec<Cell>> {
+        values
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| Cell {
+                        source_range: 0..0,
+                        content: (*c).to_string(),
+                        leading_ws: 1,
+                        trailing_ws: 1,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sort_rows_numeric_column_uses_numeric_order() {
+        let rows = rows_with(&[&["x", "2"], &["y", "10"], &["z", "1"]]);
+        let sorted = sort_rows(rows, 1, SortDirection::Ascending);
+        assert_eq!(sorted[0][1].content, "1");
+        assert_eq!(sorted[1][1].content, "2");
+        assert_eq!(sorted[2][1].content, "10");
+    }
+
+    #[test]
+    fn sort_rows_text_column_uses_case_insensitive_order() {
+        let rows = rows_with(&[&["Banana"], &["apple"], &["Cherry"]]);
+        let sorted = sort_rows(rows, 0, SortDirection::Ascending);
+        assert_eq!(sorted[0][0].content, "apple");
+        assert_eq!(sorted[1][0].content, "Banana");
+        assert_eq!(sorted[2][0].content, "Cherry");
+    }
+
+    #[test]
+    fn sort_rows_descending() {
+        let rows = rows_with(&[&["a"], &["c"], &["b"]]);
+        let sorted = sort_rows(rows, 0, SortDirection::Descending);
+        assert_eq!(sorted[0][0].content, "c");
+        assert_eq!(sorted[1][0].content, "b");
+        assert_eq!(sorted[2][0].content, "a");
+    }
+
+    #[test]
+    fn sort_rows_none_is_identity() {
+        let rows = rows_with(&[&["b"], &["a"], &["c"]]);
+        let sorted = sort_rows(rows.clone(), 0, SortDirection::None);
+        for (orig, after) in rows.iter().zip(sorted.iter()) {
+            assert_eq!(orig[0].content, after[0].content);
+        }
+    }
+
+    #[test]
+    fn sort_rows_empty_cells_go_last() {
+        let rows = rows_with(&[&["b"], &[""], &["a"]]);
+        let sorted = sort_rows(rows, 0, SortDirection::Ascending);
+        assert_eq!(sorted[0][0].content, "a");
+        assert_eq!(sorted[1][0].content, "b");
+        assert_eq!(sorted[2][0].content, "");
+        // And in descending, empties also go last (not first).
+        let rows = rows_with(&[&["b"], &[""], &["a"]]);
+        let sorted = sort_rows(rows, 0, SortDirection::Descending);
+        assert_eq!(sorted[0][0].content, "b");
+        assert_eq!(sorted[1][0].content, "a");
+        assert_eq!(sorted[2][0].content, "");
+    }
+
+    #[test]
+    fn sort_rows_mixed_numeric_and_text_uses_text_order() {
+        // "abc" doesn't parse as f64 → whole column treated as text.
+        // Then "10" < "2" alphabetically.
+        let rows = rows_with(&[&["abc"], &["2"], &["10"]]);
+        let sorted = sort_rows(rows, 0, SortDirection::Ascending);
+        assert_eq!(sorted[0][0].content, "10");
+        assert_eq!(sorted[1][0].content, "2");
+        assert_eq!(sorted[2][0].content, "abc");
+    }
+
+    #[test]
+    fn sort_rows_is_stable_for_ties() {
+        // Two rows have the same content in col 0; their relative
+        // order must be preserved.
+        let rows = rows_with(&[&["a", "first"], &["a", "second"], &["a", "third"]]);
+        let sorted = sort_rows(rows, 0, SortDirection::Ascending);
+        assert_eq!(sorted[0][1].content, "first");
+        assert_eq!(sorted[1][1].content, "second");
+        assert_eq!(sorted[2][1].content, "third");
+    }
+
+    #[test]
+    fn sort_rows_handles_negative_and_float_numerics() {
+        let rows = rows_with(&[&["-3"], &["1.5"], &["0"], &["-0.5"]]);
+        let sorted = sort_rows(rows, 0, SortDirection::Ascending);
+        assert_eq!(sorted[0][0].content, "-3");
+        assert_eq!(sorted[1][0].content, "-0.5");
+        assert_eq!(sorted[2][0].content, "0");
+        assert_eq!(sorted[3][0].content, "1.5");
+    }
+
+    #[test]
+    fn is_numeric_column_skips_empty_cells() {
+        let rows = rows_with(&[&["2"], &[""], &["10"]]);
+        assert!(is_numeric_column(&rows, 0));
+    }
+
+    #[test]
+    fn is_numeric_column_false_for_mixed() {
+        let rows = rows_with(&[&["2"], &["abc"], &["10"]]);
+        assert!(!is_numeric_column(&rows, 0));
+    }
+
+    #[test]
+    fn is_numeric_column_false_for_all_empty() {
+        let rows = rows_with(&[&[""], &[""], &[""]]);
+        assert!(!is_numeric_column(&rows, 0));
     }
 
     #[test]

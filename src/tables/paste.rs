@@ -469,6 +469,7 @@ fn rows_to_gfm(rows: Vec<Vec<String>>, style: TableStyle) -> Option<String> {
         column_widths: vec![None; cols],
         formulas: HashMap::new(),
         original_lines: None,
+        sort_indicator: None,
     };
 
     Some(match style {

@@ -19,7 +19,7 @@
 //! (e.g., raw `<table>` HTML blocks): cells in unknown tables get
 //! no attributes and are skipped over without breaking the scan.
 
-use super::model::{Alignment, MarkdownTable};
+use super::model::{Alignment, MarkdownTable, SortDirection};
 
 /// Inject `data-*` attributes on every `<th>`/`<td>` belonging to a
 /// table that the parser recognised. Other HTML passes through
@@ -108,9 +108,25 @@ pub fn inject_table_attrs(html: &str, tables: &[MarkdownTable]) -> String {
                         Some(Alignment::Right) => "right",
                         _ => "none",
                     };
+                    // data-sort-dir is set ONLY on the header cell of the
+                    // currently-sorted column, so the JS toolbar reads it
+                    // off the active cell to show the right tri-state.
+                    let sort_attr = if in_head {
+                        match table.sort_indicator {
+                            Some((sc, SortDirection::Ascending)) if sc == col_idx => {
+                                " data-sort-dir=\"asc\""
+                            }
+                            Some((sc, SortDirection::Descending)) if sc == col_idx => {
+                                " data-sort-dir=\"desc\""
+                            }
+                            _ => "",
+                        }
+                    } else {
+                        ""
+                    };
                     let attrs = format!(
-                        r#" class="rmd-cell" data-table-id="{}" data-row="{}" data-col="{}" data-align="{}" data-raw="{}""#,
-                        table.id, row_attr, col_idx, align_attr, raw_encoded
+                        r#" class="rmd-cell" data-table-id="{}" data-row="{}" data-col="{}" data-align="{}"{} data-raw="{}""#,
+                        table.id, row_attr, col_idx, align_attr, sort_attr, raw_encoded
                     );
                     // Inject just before the closing `>`. Defensive against
                     // self-closing `<th/>` even though comrak doesn't emit them.
@@ -352,6 +368,16 @@ pub const TABLE_EDIT_JS: &str = r#"
     align.forEach(function(s) {
       addToolbarButton(s[0], s[1], s[2], true);
     });
+    // Sort button — also header-only. Tri-state cycle: off → asc →
+    // desc → off. Label/active state is refreshed on every
+    // showToolbarForCell based on the active cell's data-sort-dir.
+    addToolbarButton(
+      "sort",
+      "↕ Sort",
+      "Sort by this column (cycles asc / desc / off)",
+      true,
+      "sort"
+    );
     // Reformat is always visible (independent of header/body), so
     // give it its own thin divider so it doesn't crowd the L/C/R
     // cluster when those are hidden for body cells.
@@ -367,10 +393,13 @@ pub const TABLE_EDIT_JS: &str = r#"
     document.body.appendChild(toolbar);
     return toolbar;
   }
-  function addToolbarButton(action, label, title, isAlign) {
+  function addToolbarButton(action, label, title, isHeaderOnly, kind) {
     var btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "rmd-table-toolbar-btn" + (isAlign ? " rmd-table-toolbar-align" : "");
+    var classes = ["rmd-table-toolbar-btn"];
+    if (isHeaderOnly) classes.push("rmd-table-toolbar-align");
+    if (kind === "sort") classes.push("rmd-table-toolbar-sort");
+    btn.className = classes.join(" ");
     btn.setAttribute("data-action", action);
     btn.textContent = label;
     btn.title = title;
@@ -381,9 +410,19 @@ pub const TABLE_EDIT_JS: &str = r#"
       e.preventDefault();
       e.stopPropagation();
       if (!active) return;
-      // Toggle: clicking the already-active alignment reverts to none.
       var resolvedOp = action;
-      if (isAlign && btn.classList.contains("rmd-table-toolbar-active")) {
+      if (kind === "sort") {
+        // Tri-state cycle: read the cell's current state and pick
+        // the next one. Backend handles the actual reordering and
+        // the original-order snapshot.
+        var current = active.getAttribute("data-sort-dir") || "off";
+        var next = current === "off" ? "asc"
+                 : current === "asc" ? "desc"
+                 : "off";
+        resolvedOp = "sort-" + next;
+      } else if (action.indexOf("align-") === 0
+                 && btn.classList.contains("rmd-table-toolbar-active")) {
+        // Clicking the already-active alignment reverts to none.
         resolvedOp = "align-none";
       }
       dispatchStructureOp(resolvedOp);
@@ -408,9 +447,23 @@ pub const TABLE_EDIT_JS: &str = r#"
     if (isHeader) {
       var currentAlign = cell.getAttribute("data-align") || "none";
       tb.querySelectorAll(".rmd-table-toolbar-align").forEach(function(b) {
-        var op = b.getAttribute("data-action").slice("align-".length);
+        var action = b.getAttribute("data-action") || "";
+        if (action.indexOf("align-") !== 0) return; // skip sort
+        var op = action.slice("align-".length);
         b.classList.toggle("rmd-table-toolbar-active", op === currentAlign);
       });
+      // Tri-state sort indicator: label + active class follow the
+      // active cell's data-sort-dir, which the post-processor sets
+      // only on the currently-sorted header column.
+      var sortBtn = tb.querySelector(".rmd-table-toolbar-sort");
+      if (sortBtn) {
+        var dir = cell.getAttribute("data-sort-dir") || "off";
+        sortBtn.textContent =
+          dir === "asc" ? "↑ Sort"
+            : dir === "desc" ? "↓ Sort"
+            : "↕ Sort";
+        sortBtn.classList.toggle("rmd-table-toolbar-active", dir !== "off");
+      }
     }
 
     // Measure after the show/hide so the rect is final.
