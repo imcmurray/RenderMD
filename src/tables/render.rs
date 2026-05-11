@@ -56,7 +56,30 @@ pub fn inject_table_attrs(html: &str, tables: &[MarkdownTable]) -> String {
             // Track structural state. We do this *before* deciding
             // whether to inject — opening `<tr>` resets col_idx, etc.
             match name.as_str() {
-                "table" => in_table = true,
+                "table" => {
+                    in_table = true;
+                    // Inject `class="rmd-table-fixed"` on the opening
+                    // tag for any parsed table that has explicit
+                    // column widths. `table-layout: fixed` is what
+                    // makes the per-column widths take effect; the
+                    // CSS class also enables overflow-hidden so cell
+                    // content respects the width.
+                    if table_idx < tables.len()
+                        && tables[table_idx].column_widths.iter().any(|w| w.is_some())
+                    {
+                        let close = tag.rfind('>').unwrap();
+                        let pre_close = if tag[..close].ends_with('/') {
+                            close - 1
+                        } else {
+                            close
+                        };
+                        out.push_str(&tag[..pre_close]);
+                        out.push_str(r#" class="rmd-table-fixed""#);
+                        out.push_str(&tag[pre_close..]);
+                        i = tag_end;
+                        continue;
+                    }
+                }
                 "/table" => {
                     in_table = false;
                     in_head = false;
@@ -124,9 +147,20 @@ pub fn inject_table_attrs(html: &str, tables: &[MarkdownTable]) -> String {
                     } else {
                         ""
                     };
+                    // Width is painted on header cells only — under
+                    // table-layout: fixed the header row determines
+                    // each column's width and body cells inherit.
+                    let width_attr = if in_head {
+                        match table.column_widths.get(col_idx).and_then(|w| *w) {
+                            Some(w) => format!(r#" style="width: {w}px""#),
+                            None => String::new(),
+                        }
+                    } else {
+                        String::new()
+                    };
                     let attrs = format!(
-                        r#" class="rmd-cell" data-table-id="{}" data-row="{}" data-col="{}" data-align="{}"{} data-raw="{}""#,
-                        table.id, row_attr, col_idx, align_attr, sort_attr, raw_encoded
+                        r#" class="rmd-cell" data-table-id="{}" data-row="{}" data-col="{}" data-align="{}"{}{} data-raw="{}""#,
+                        table.id, row_attr, col_idx, align_attr, sort_attr, width_attr, raw_encoded
                     );
                     // Inject just before the closing `>`. Defensive against
                     // self-closing `<th/>` even though comrak doesn't emit them.
@@ -232,6 +266,10 @@ pub const TABLE_EDIT_JS: &str = r#"
 
   document.addEventListener("click", function(e) {
     if (!e.target.closest) return;
+    // Clicks on the resize handle are part of the drag flow — they
+    // must not begin a cell edit, even though the handle lives
+    // inside the header cell.
+    if (e.target.closest && e.target.closest(".rmd-th-resize-handle")) return;
     var cell = e.target.closest(".rmd-cell");
     if (!cell) return;
     if (active === cell) return;
@@ -559,6 +597,85 @@ pub const TABLE_EDIT_JS: &str = r#"
     if (!cell) return;
     cell.click();
   };
+
+  // -- Column resize handles -------------------------------------
+  // Inject a thin draggable handle on the right edge of every
+  // header cell. mousedown → mousemove updates the live inline
+  // width (forcing table-layout: fixed during the drag so the
+  // visual matches what we'll persist); mouseup posts the full
+  // per-table widths vector back to Rust as one tableResizeColumns
+  // message — applied as a single undo step.
+  function attachResizeHandles() {
+    document.querySelectorAll('th.rmd-cell').forEach(function(th) {
+      if (th.querySelector('.rmd-th-resize-handle')) return;
+      var handle = document.createElement('div');
+      handle.className = 'rmd-th-resize-handle';
+      handle.addEventListener('mousedown', function(ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        startResize(th, handle, ev);
+      });
+      // Belt-and-braces: stop click on the handle from bubbling to
+      // the cell's click → beginEdit listener.
+      handle.addEventListener('click', function(ev) { ev.stopPropagation(); });
+      th.appendChild(handle);
+    });
+  }
+
+  function startResize(th, handle, downEvent) {
+    if (!msg.tableResizeColumns) return;
+    var startX = downEvent.clientX;
+    var startWidth = th.getBoundingClientRect().width;
+    var tableId = th.getAttribute('data-table-id');
+    var tableEl = th.closest('table');
+    if (!tableEl) return;
+    var totalMovement = 0;
+    handle.classList.add('rmd-resizing');
+    document.body.classList.add('rmd-resizing-table');
+    // Force fixed layout during drag so width changes are visible
+    // immediately, regardless of the table's current rendering mode.
+    var prevLayout = tableEl.style.tableLayout;
+    tableEl.style.tableLayout = 'fixed';
+
+    function onMove(ev) {
+      var dx = ev.clientX - startX;
+      totalMovement = Math.max(totalMovement, Math.abs(dx));
+      var newWidth = Math.max(40, Math.round(startWidth + dx));
+      th.style.width = newWidth + 'px';
+    }
+    function onUp() {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      handle.classList.remove('rmd-resizing');
+      document.body.classList.remove('rmd-resizing-table');
+      // Sub-3px movement is treated as an accidental click on the
+      // handle, not a deliberate resize — leave the table alone.
+      if (totalMovement < 3) {
+        tableEl.style.tableLayout = prevLayout;
+        th.style.width = '';
+        return;
+      }
+      // Collect all column widths for this table; empty string for
+      // columns the user hasn't sized explicitly.
+      var ths = tableEl.querySelectorAll(
+        'th.rmd-cell[data-table-id="' + tableId + '"]'
+      );
+      var widths = [];
+      ths.forEach(function(h) {
+        var w = h.style.width || '';
+        if (!w) { widths.push(''); return; }
+        var n = parseFloat(w);
+        widths.push(isNaN(n) ? '' : Math.round(n).toString());
+      });
+      msg.tableResizeColumns.postMessage(tableId + '\t' + widths.join(','));
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
+  // Initial attachment + after every preview refresh (re-running
+  // the IIFE is idempotent thanks to the `querySelector` guard).
+  attachResizeHandles();
 })();
 </script>
 "#;
@@ -675,6 +792,57 @@ mod tests {
             "<table><thead><tr><th>a</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>";
         let out = inject_table_attrs(html, &tables);
         assert!(out.contains(r#"data-align="none""#));
+    }
+
+    #[test]
+    fn injection_adds_fixed_layout_class_when_widths_set() {
+        let src = "<!-- rmd-cols: 180,120 -->\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let tables = parse_tables(src);
+        assert_eq!(tables[0].column_widths, vec![Some(180), Some(120)]);
+        let html = "<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>";
+        let out = inject_table_attrs(html, &tables);
+        assert!(
+            out.contains(r#"<table class="rmd-table-fixed""#),
+            "got: {out}"
+        );
+        // Header cells carry the inline width style.
+        assert!(out.contains(r#"style="width: 180px""#));
+        assert!(out.contains(r#"style="width: 120px""#));
+        // Body cells do NOT (header row drives table-layout: fixed).
+        let body_start = out.find("<tbody>").unwrap();
+        assert!(!out[body_start..].contains("style=\"width:"));
+    }
+
+    #[test]
+    fn injection_no_width_class_when_all_widths_none() {
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let tables = parse_tables(src);
+        let html = "<table><thead><tr><th>a</th><th>b</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>";
+        let out = inject_table_attrs(html, &tables);
+        assert!(!out.contains("rmd-table-fixed"));
+        assert!(!out.contains("style=\"width:"));
+    }
+
+    #[test]
+    fn injection_partial_widths_paints_only_set_columns() {
+        let src = "<!-- rmd-cols: 180,,90 -->\n| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n";
+        let tables = parse_tables(src);
+        let html = "<table><thead><tr><th>a</th><th>b</th><th>c</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td></tr></tbody></table>";
+        let out = inject_table_attrs(html, &tables);
+        assert!(out.contains(r#"<table class="rmd-table-fixed""#));
+        assert!(out.contains(r#"style="width: 180px""#));
+        assert!(out.contains(r#"style="width: 90px""#));
+        // Middle column has no explicit width — no style attribute.
+        // Find the second <th and verify it has no style=.
+        let head = out.find("<thead>").unwrap();
+        let body = out.find("<tbody>").unwrap();
+        let head_slice = &out[head..body];
+        // Count style= occurrences in the header — should be exactly 2.
+        assert_eq!(
+            head_slice.matches("style=").count(),
+            2,
+            "head: {head_slice}"
+        );
     }
 
     #[test]

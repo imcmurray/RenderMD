@@ -415,6 +415,18 @@ impl MarkdownTable {
         crate::tables::serialize::replace_rows(self, new_rows, buffer)
     }
 
+    /// Set the column widths used by the resize handles. Triggers a
+    /// structural re-serialize so the persistence comment is
+    /// written/refreshed in front of the table. Pass all-`None`
+    /// widths to drop the comment entirely.
+    pub fn set_column_widths(
+        &mut self,
+        widths: Vec<Option<u32>>,
+        buffer: &mut String,
+    ) -> Result<EditDelta> {
+        crate::tables::serialize::set_column_widths(self, widths, buffer)
+    }
+
     /// Compute the navigation target for a Tab / Shift+Tab / Enter
     /// / Shift+Enter press inside the cell at `(row, col)`.
     ///

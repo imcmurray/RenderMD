@@ -311,6 +311,33 @@ img {
   background: var(--border);
   margin: 2px 4px;
 }
+.rmd-table-fixed {
+  table-layout: fixed;
+}
+.rmd-table-fixed th, .rmd-table-fixed td {
+  overflow: hidden;
+  word-break: break-word;
+}
+th.rmd-cell { position: relative; }
+.rmd-th-resize-handle {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 3;
+  user-select: none;
+}
+.rmd-th-resize-handle:hover,
+.rmd-th-resize-handle.rmd-resizing {
+  background: var(--accent);
+  opacity: 0.4;
+}
+.rmd-resizing-table, .rmd-resizing-table * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
 .rmd-history-rail {
   position: fixed;
   left: 8px;
@@ -2761,6 +2788,7 @@ impl State {
         manager.register_script_message_handler("tableNavigate", None);
         manager.register_script_message_handler("tableStructure", None);
         manager.register_script_message_handler("tableSort", None);
+        manager.register_script_message_handler("tableResizeColumns", None);
 
         let st = self.clone();
         manager.connect_script_message_received(Some("imageClick"), move |_, value| {
@@ -2798,6 +2826,77 @@ impl State {
         manager.connect_script_message_received(Some("tableSort"), move |_, value| {
             st.handle_table_sort(&value.to_str());
         });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("tableResizeColumns"), move |_, value| {
+            st.handle_table_resize_columns(&value.to_str());
+        });
+    }
+
+    /// Commit the column widths produced by the resize-handle drag.
+    ///
+    /// Payload is `table_id\twidths` where `widths` is a comma-
+    /// separated list with empties for unset columns
+    /// (e.g. `180,,120`). Stored as `<!-- rmd-cols: ... -->` in the
+    /// markdown source by the serializer, and applied as a single
+    /// undo step so Ctrl+Z reverses the whole drag.
+    fn handle_table_resize_columns(&self, message: &str) {
+        let mut parts = message.splitn(2, '\t');
+        let table_id: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let widths_csv = parts.next().unwrap_or("");
+        if table_id == 0 {
+            return;
+        }
+
+        let widths: Vec<Option<u32>> = widths_csv
+            .split(',')
+            .map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse::<u32>().ok()
+                }
+            })
+            .collect();
+
+        let buffer_text = self.buffer_text();
+        let mut tables_vec = tables::parse_tables(&buffer_text);
+        let table = match tables_vec.iter_mut().find(|t| t.id == table_id) {
+            Some(t) => t,
+            None => {
+                self.show_toast("Couldn't locate that table — refreshing");
+                if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                    self.refresh_preview();
+                }
+                return;
+            }
+        };
+
+        if widths.len() != table.alignments.len() {
+            self.show_toast(&format!(
+                "Resize ignored: got {} widths, table has {} columns",
+                widths.len(),
+                table.alignments.len()
+            ));
+            return;
+        }
+        if widths == table.column_widths {
+            // No-op drag — nothing to persist.
+            return;
+        }
+
+        let mut shadow = buffer_text.clone();
+        let delta = match table.set_column_widths(widths, &mut shadow) {
+            Ok(d) => d,
+            Err(e) => {
+                self.show_toast(&format!("Resize failed: {e}"));
+                return;
+            }
+        };
+        self.apply_buffer_patch(&buffer_text, &shadow, &delta);
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
     }
 
     /// Apply a sort operation triggered by the toolbar's tri-state

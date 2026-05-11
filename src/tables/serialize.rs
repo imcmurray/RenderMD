@@ -20,12 +20,61 @@ use super::model::*;
 use super::parse::{capture_original_lines, split_cells};
 
 /// Serialise a table to GFM source per its style.
+///
+/// If any column has a persisted width, an `<!-- rmd-cols: ... -->`
+/// comment is prepended on its own line. This is the persistence
+/// side of the column-resize feature; viewers that don't recognise
+/// the comment treat it as a regular HTML comment and ignore it.
 pub fn to_gfm(table: &MarkdownTable, buffer: &str) -> String {
-    match table.style {
+    let body = match table.style {
         TableStyle::Compact => to_gfm_compact(table),
         TableStyle::Pretty => to_gfm_pretty(table),
         TableStyle::PreserveOriginal => to_gfm_preserve(table, buffer),
+    };
+    match build_column_widths_comment(&table.column_widths) {
+        Some(comment) => format!("{comment}\n{body}"),
+        None => body,
     }
+}
+
+/// Build the persistence comment for `column_widths` if any column
+/// has an explicit width. `Some(180)` → `"180"`, `None` → empty. The
+/// format mirrors what [`crate::tables::parse::extract_column_widths_comment`]
+/// expects so a round-trip is lossless.
+fn build_column_widths_comment(widths: &[Option<u32>]) -> Option<String> {
+    if widths.iter().all(|w| w.is_none()) {
+        return None;
+    }
+    let parts: Vec<String> = widths
+        .iter()
+        .map(|w| match w {
+            Some(n) => n.to_string(),
+            None => String::new(),
+        })
+        .collect();
+    Some(format!("<!-- rmd-cols: {} -->", parts.join(",")))
+}
+
+/// Replace the table's persisted column widths and trigger a
+/// structural re-serialize. Pass `widths.len() == table.alignments.len()`
+/// or you get back an `InvalidStructure` error.
+///
+/// Passing all-`None` widths drops the persistence comment from the
+/// next emit — that's how the "clear all widths" command is built.
+pub fn set_column_widths(
+    table: &mut MarkdownTable,
+    widths: Vec<Option<u32>>,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    if widths.len() != table.alignments.len() {
+        return Err(TableError::InvalidStructure(format!(
+            "column_widths length {} doesn't match table columns {}",
+            widths.len(),
+            table.alignments.len()
+        )));
+    }
+    table.column_widths = widths;
+    re_serialize_structurally(table, buffer)
 }
 
 /// Single-space padding. Always reformats.
@@ -704,6 +753,12 @@ fn refresh_internal_ranges(table: &mut MarkdownTable, buffer: &str) {
         if line.trim().is_empty() {
             continue;
         }
+        // The width-persistence comment lives inside source_range but
+        // isn't structural — skip it so column source-ranges stay
+        // bound to actual cells.
+        if super::parse::is_rmd_cols_comment(line) {
+            continue;
+        }
         if super::parse::is_separator_line(line) {
             seen_separator = true;
             continue;
@@ -1235,5 +1290,116 @@ mod tests {
         t.rows[0].pop();
         t.insert_column(2, Alignment::None, &mut buffer).unwrap();
         assert_eq!(t.rows[0].len(), 3);
+    }
+
+    #[test]
+    fn set_column_widths_emits_comment() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.set_column_widths(vec![Some(180), None], &mut buffer)
+            .unwrap();
+        // Persistence comment now sits above the table.
+        assert!(
+            buffer.starts_with("<!-- rmd-cols: 180, -->\n"),
+            "got: {buffer}"
+        );
+        // Re-parse should round-trip.
+        let parsed = parse_tables(&buffer);
+        assert_eq!(parsed[0].column_widths, vec![Some(180), None]);
+    }
+
+    #[test]
+    fn set_column_widths_all_none_drops_comment() {
+        // Pre-existing comment, then set widths to all-None — the
+        // emit should not include the comment anymore.
+        let mut buffer =
+            String::from("<!-- rmd-cols: 100,200 -->\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        assert_eq!(tables[0].column_widths, vec![Some(100), Some(200)]);
+        let t = &mut tables[0];
+        t.set_column_widths(vec![None, None], &mut buffer).unwrap();
+        assert!(
+            !buffer.contains("rmd-cols"),
+            "comment was not removed: {buffer}"
+        );
+    }
+
+    #[test]
+    fn set_column_widths_wrong_count_errors() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        let err = t
+            .set_column_widths(vec![Some(100), Some(200), Some(300)], &mut buffer)
+            .unwrap_err();
+        assert!(matches!(err, TableError::InvalidStructure(_)));
+    }
+
+    #[test]
+    fn set_column_widths_preserves_preserve_original_mode() {
+        let original = "| name  | score |\n|-------|------:|\n| Alice |    42 |\n";
+        let mut buffer = String::from(original);
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        t.set_column_widths(vec![Some(120), None], &mut buffer)
+            .unwrap();
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        // Cell edits still work surgically after widths are set.
+        t.update_cell(0, 0, "Bob", &mut buffer).unwrap();
+        assert!(buffer.contains("Bob"));
+        assert!(buffer.contains("rmd-cols"));
+    }
+
+    #[test]
+    fn column_widths_survive_insert_column() {
+        let mut buffer =
+            String::from("<!-- rmd-cols: 100,200 -->\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.insert_column(1, Alignment::None, &mut buffer).unwrap();
+        // Existing widths preserved; the inserted column slot is None.
+        assert_eq!(t.column_widths, vec![Some(100), None, Some(200)]);
+        // Re-parse confirms the same values came back out.
+        let parsed = parse_tables(&buffer);
+        assert_eq!(parsed[0].column_widths, vec![Some(100), None, Some(200)]);
+    }
+
+    #[test]
+    fn column_widths_survive_delete_column() {
+        let mut buffer = String::from(
+            "<!-- rmd-cols: 100,200,300 -->\n| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n",
+        );
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.delete_column(1, &mut buffer).unwrap();
+        assert_eq!(t.column_widths, vec![Some(100), Some(300)]);
+        let parsed = parse_tables(&buffer);
+        assert_eq!(parsed[0].column_widths, vec![Some(100), Some(300)]);
+    }
+
+    #[test]
+    fn column_widths_survive_cell_edit_in_preserve_mode() {
+        let mut buffer =
+            String::from("<!-- rmd-cols: 100,200 -->\n| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.update_cell(0, 0, "z", &mut buffer).unwrap();
+        // Comment still sits above the table after a surgical edit.
+        assert!(buffer.starts_with("<!-- rmd-cols: 100,200 -->\n"));
+    }
+
+    #[test]
+    fn build_column_widths_comment_format() {
+        assert_eq!(
+            build_column_widths_comment(&[Some(180), None, Some(120)]),
+            Some("<!-- rmd-cols: 180,,120 -->".to_string())
+        );
+        assert_eq!(build_column_widths_comment(&[None, None]), None);
+        assert_eq!(
+            build_column_widths_comment(&[Some(50)]),
+            Some("<!-- rmd-cols: 50 -->".to_string())
+        );
     }
 }

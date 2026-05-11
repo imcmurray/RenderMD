@@ -43,7 +43,74 @@ pub fn parse_tables(buffer: &str) -> Vec<MarkdownTable> {
             i += 1;
         }
     }
+
+    // Second pass: bind any preceding `<!-- rmd-cols: ... -->` width
+    // comments to their table. The comment is the persistence layer
+    // for the column-resize feature; binding it here means the
+    // resulting `MarkdownTable.column_widths` arrives populated for
+    // both the post-processor (which paints widths into HTML) and
+    // the serializer (which re-emits the comment on save).
+    for table in &mut tables {
+        if let Some((widths, comment_start)) =
+            extract_column_widths_comment(buffer, table.source_range.start)
+        {
+            if widths.len() == table.alignments.len() {
+                table.column_widths = widths;
+            }
+            // Whether or not the width count matched, fold the
+            // comment into source_range so the next re-serialization
+            // overwrites it cleanly (avoids a stale comment marooned
+            // above the table).
+            table.source_range.start = comment_start;
+        }
+    }
     tables
+}
+
+/// Detect an `<!-- rmd-cols: ... -->` width-persistence comment
+/// occupying the single line immediately above `table_start`. Returns
+/// the parsed widths and the byte offset of the start of the comment
+/// line so the caller can extend `source_range` to cover both.
+///
+/// `<!-- rmd-cols: 180,,120 -->` parses as `[Some(180), None, Some(120)]`
+/// — the empty between commas means "no explicit width for that
+/// column".
+pub fn extract_column_widths_comment(
+    buffer: &str,
+    table_start: usize,
+) -> Option<(Vec<Option<u32>>, usize)> {
+    if table_start == 0 {
+        return None;
+    }
+    let before = &buffer[..table_start];
+    // The byte immediately preceding the table must be a newline —
+    // we only bind a comment that occupies its own line.
+    if !before.ends_with('\n') {
+        return None;
+    }
+    let line_end = table_start - 1; // exclusive position of the \n
+    let bytes_before_nl = &before[..line_end];
+    let comment_start = bytes_before_nl.rfind('\n').map(|p| p + 1).unwrap_or(0);
+    let comment_line = &before[comment_start..line_end];
+
+    let trimmed = comment_line.trim();
+    let inside = trimmed.strip_prefix("<!-- rmd-cols:")?;
+    let inside = inside.strip_suffix("-->")?;
+    let inside = inside.trim();
+
+    let widths: Vec<Option<u32>> = inside
+        .split(',')
+        .map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                s.parse::<u32>().ok()
+            }
+        })
+        .collect();
+
+    Some((widths, comment_start))
 }
 
 fn map_align(a: PdAlignment) -> Alignment {
@@ -210,8 +277,21 @@ pub fn is_separator_line(s: &str) -> bool {
         && trimmed.contains('-')
 }
 
+/// `true` if `s` is the column-widths persistence comment that
+/// belongs above the next table. Used by both the parser (which
+/// pulls the line into `source_range`) and the serializer (which
+/// re-emits it through a dedicated codepath rather than treating it
+/// as a table row).
+pub fn is_rmd_cols_comment(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with("<!-- rmd-cols:") && t.ends_with("-->")
+}
+
 /// Capture verbatim source lines for the PreserveOriginal round-trip
-/// strategy. Empty lines inside the table block are skipped.
+/// strategy. Empty lines and the rmd-cols width-persistence comment
+/// inside the table block are skipped — the comment is re-emitted
+/// through `to_gfm` directly, so we don't want it leaking into a
+/// rebuilt header row.
 pub fn capture_original_lines(table_src: &str) -> Vec<OriginalLine> {
     let mut row_index = 0usize;
     let mut seen_separator = false;
@@ -219,6 +299,9 @@ pub fn capture_original_lines(table_src: &str) -> Vec<OriginalLine> {
 
     for line in table_src.lines() {
         if line.trim().is_empty() {
+            continue;
+        }
+        if is_rmd_cols_comment(line) {
             continue;
         }
         let kind = if is_separator_line(line) {
@@ -380,5 +463,55 @@ mod tests {
         assert_eq!(t.headers[1].content, "");
         assert_eq!(t.rows[0][0].content, "");
         assert_eq!(t.rows[0][1].content, "b");
+    }
+
+    #[test]
+    fn parses_column_widths_comment() {
+        let src = "<!-- rmd-cols: 180,,120 -->\n| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n";
+        let t = &parse_tables(src)[0];
+        assert_eq!(t.column_widths, vec![Some(180), None, Some(120)]);
+        // source_range starts at the beginning of the comment so a
+        // re-serialize replaces both.
+        assert_eq!(t.source_range.start, 0);
+        assert!(src[t.source_range.clone()].starts_with("<!-- rmd-cols:"));
+    }
+
+    #[test]
+    fn column_widths_comment_ignored_when_count_mismatches() {
+        // Two-column table but the comment lists three widths — the
+        // values shouldn't be applied (defaults stay all-None), but
+        // the comment IS pulled into source_range so a future
+        // re-serialize cleans it up.
+        let src = "<!-- rmd-cols: 100,200,300 -->\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let t = &parse_tables(src)[0];
+        assert_eq!(t.column_widths, vec![None, None]);
+        assert_eq!(t.source_range.start, 0);
+    }
+
+    #[test]
+    fn column_widths_comment_missing_leaves_defaults() {
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let t = &parse_tables(src)[0];
+        assert_eq!(t.column_widths, vec![None, None]);
+        // No comment → source_range starts where the table starts.
+        assert!(src[..t.source_range.start].is_empty());
+    }
+
+    #[test]
+    fn column_widths_comment_with_surrounding_text_not_bound() {
+        // Comment on the same line as other text doesn't bind to the
+        // table — we require it to occupy its own line.
+        let src = "foo <!-- rmd-cols: 10,20 -->\n| a | b |\n|---|---|\n| 1 | 2 |\n";
+        let t = &parse_tables(src)[0];
+        assert_eq!(t.column_widths, vec![None, None]);
+    }
+
+    #[test]
+    fn extract_column_widths_handles_extra_whitespace() {
+        // Tolerate looser spacing inside the comment.
+        let src = "<!-- rmd-cols:  100, , 200  -->\n| a | b | c |\n|---|---|---|\n";
+        let (widths, start) = extract_column_widths_comment(src, src.find("| a").unwrap()).unwrap();
+        assert_eq!(widths, vec![Some(100), None, Some(200)]);
+        assert_eq!(start, 0);
     }
 }
