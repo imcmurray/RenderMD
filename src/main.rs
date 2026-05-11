@@ -2114,6 +2114,12 @@ struct StateInner {
     git_history: RefCell<Option<Vec<Commit>>>,
     viewing_snapshot: RefCell<Option<HistorySnapshot>>,
     history_visible: Cell<bool>,
+
+    // Set by `handle_table_navigate` and consumed by the next
+    // `refresh_preview`: tells the WebView which cell to focus
+    // (programmatically click) once the new HTML loads, so Tab/Enter
+    // navigation between cells feels continuous to the user.
+    pending_focus_cell: RefCell<Option<(tables::TableId, i32, usize)>>,
     toggle_handler: RefCell<Option<glib::SignalHandlerId>>,
     buffer_handler: RefCell<Option<glib::SignalHandlerId>>,
 
@@ -2173,6 +2179,7 @@ impl State {
             git_history: RefCell::new(None),
             viewing_snapshot: RefCell::new(None),
             history_visible: Cell::new(true),
+            pending_focus_cell: RefCell::new(None),
             toggle_handler: RefCell::new(None),
             buffer_handler: RefCell::new(None),
             watcher: RefCell::new(None),
@@ -2685,6 +2692,7 @@ impl State {
         manager.register_script_message_handler("toggleHistory", None);
         manager.register_script_message_handler("scrollTo", None);
         manager.register_script_message_handler("tableEdit", None);
+        manager.register_script_message_handler("tableNavigate", None);
 
         let st = self.clone();
         manager.connect_script_message_received(Some("imageClick"), move |_, value| {
@@ -2710,6 +2718,101 @@ impl State {
         manager.connect_script_message_received(Some("tableEdit"), move |_, value| {
             st.handle_table_edit(&value.to_str());
         });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("tableNavigate"), move |_, value| {
+            st.handle_table_navigate(&value.to_str());
+        });
+    }
+
+    /// Splice a table-subsystem patch into the GtkTextBuffer as a
+    /// single atomic edit. Used by both `handle_table_edit` and
+    /// `handle_table_navigate` so undo treats each cell change /
+    /// row insert as one Ctrl+Z step.
+    fn apply_buffer_patch(&self, old_text: &str, new_text: &str, delta: &tables::EditDelta) {
+        let char_start = old_text[..delta.patched_range.start].chars().count() as i32;
+        let char_end = old_text[..delta.patched_range.end].chars().count() as i32;
+        let replacement = &new_text[delta.new_range.clone()];
+
+        let buf = &self.inner.buffer;
+        self.inner.suppress_modify.set(true);
+        buf.begin_user_action();
+        let mut start = buf.iter_at_offset(char_start);
+        let mut end = buf.iter_at_offset(char_end);
+        buf.delete(&mut start, &mut end);
+        let mut at = buf.iter_at_offset(char_start);
+        buf.insert(&mut at, replacement);
+        buf.end_user_action();
+        self.inner.suppress_modify.set(false);
+
+        if !self.inner.is_modified.get() {
+            self.inner.is_modified.set(true);
+            self.update_title();
+        }
+    }
+
+    /// Process a Tab / Shift+Tab / Enter / Shift+Enter press inside an
+    /// editable table cell.
+    ///
+    /// Payload is tab-delimited `table_id\trow\tcol\tdirection` where
+    /// `direction` is one of `next` | `prev` | `down` | `up`.
+    ///
+    /// Flow:
+    ///   1. Re-parse tables, find the requested table by id.
+    ///   2. Ask the model where to go via `MarkdownTable::navigate`.
+    ///   3. If the target requires a new row, call `insert_empty_row`
+    ///      and splice the resulting patch into the buffer.
+    ///   4. Stash `(table_id, row, col)` in `pending_focus_cell` so
+    ///      the *next* `refresh_preview` injects a one-shot script
+    ///      that programmatically clicks the target cell — which the
+    ///      existing click handler treats as a normal beginEdit.
+    fn handle_table_navigate(&self, message: &str) {
+        let mut parts = message.splitn(4, '\t');
+        let table_id: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let row: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let col: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let direction_str = parts.next().unwrap_or("");
+        if table_id == 0 {
+            return;
+        }
+        let direction = match direction_str {
+            "next" => tables::model::NavDirection::Next,
+            "prev" => tables::model::NavDirection::Prev,
+            "down" => tables::model::NavDirection::Down,
+            "up" => tables::model::NavDirection::Up,
+            _ => return,
+        };
+
+        let buffer_text = self.buffer_text();
+        let mut tables_vec = tables::parse_tables(&buffer_text);
+        let table = match tables_vec.iter_mut().find(|t| t.id == table_id) {
+            Some(t) => t,
+            None => {
+                self.show_toast("Couldn't locate that table — refreshing");
+                if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                    self.refresh_preview();
+                }
+                return;
+            }
+        };
+
+        let target = table.navigate(row, col, direction);
+
+        if target.created_row {
+            let mut shadow = buffer_text.clone();
+            match table.insert_empty_row(target.row as usize, &mut shadow) {
+                Ok(delta) => self.apply_buffer_patch(&buffer_text, &shadow, &delta),
+                Err(e) => {
+                    self.show_toast(&format!("Couldn't add row: {e}"));
+                    return;
+                }
+            }
+        }
+
+        *self.inner.pending_focus_cell.borrow_mut() = Some((table_id, target.row, target.col));
+
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
     }
 
     /// Apply a click-to-edit cell commit from the WebView.
@@ -2770,27 +2873,7 @@ impl State {
             // No-op edit (content identical) — nothing to do.
             return;
         }
-
-        // Translate byte offsets to char offsets for GtkTextIter.
-        let char_start = buffer_text[..delta.patched_range.start].chars().count() as i32;
-        let char_end = buffer_text[..delta.patched_range.end].chars().count() as i32;
-        let replacement = &shadow[delta.new_range.clone()];
-
-        let buf = &self.inner.buffer;
-        self.inner.suppress_modify.set(true);
-        buf.begin_user_action();
-        let mut start = buf.iter_at_offset(char_start);
-        let mut end = buf.iter_at_offset(char_end);
-        buf.delete(&mut start, &mut end);
-        let mut at = buf.iter_at_offset(char_start);
-        buf.insert(&mut at, replacement);
-        buf.end_user_action();
-        self.inner.suppress_modify.set(false);
-
-        if !self.inner.is_modified.get() {
-            self.inner.is_modified.set(true);
-            self.update_title();
-        }
+        self.apply_buffer_patch(&buffer_text, &shadow, &delta);
         if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
             self.refresh_preview();
         }
@@ -3211,6 +3294,31 @@ impl State {
                 }
             }
             None => html_with_tables,
+        };
+
+        // Tab/Enter navigation landed us on a specific cell — inject a
+        // one-shot script that calls `window.rmdFocusCell(...)` once
+        // the page loads. The IIFE retries briefly because TABLE_EDIT_JS
+        // may run a tick later than this script depending on load order.
+        let final_html = if let Some((tid, r, c)) = s.pending_focus_cell.borrow_mut().take() {
+            let focus_js = format!(
+                "<script>(function(){{\n\
+                  function tryFocus(retries){{\n\
+                    var fn = window.rmdFocusCell;\n\
+                    if (!fn) {{ if (retries > 0) setTimeout(function(){{ tryFocus(retries-1); }}, 30); return; }}\n\
+                    fn({tid}, {r}, {c});\n\
+                  }}\n\
+                  if (document.readyState === \"loading\") {{\n\
+                    document.addEventListener(\"DOMContentLoaded\", function(){{ tryFocus(10); }});\n\
+                  }} else {{ tryFocus(10); }}\n\
+                }})();</script>",
+                tid = tid,
+                r = r,
+                c = c
+            );
+            final_html.replacen("</body>", &format!("{focus_js}\n</body>"), 1)
+        } else {
+            final_html
         };
 
         let path_str = base_dir.to_string_lossy();

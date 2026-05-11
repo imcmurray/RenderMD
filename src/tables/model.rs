@@ -134,6 +134,33 @@ pub struct EditDelta {
     pub new_range: Range<usize>,
 }
 
+/// Direction for [`MarkdownTable::navigate`].
+///
+/// Maps directly to the keys the user pressed inside an editable cell:
+///   - `Tab` → [`NavDirection::Next`]
+///   - `Shift+Tab` → [`NavDirection::Prev`]
+///   - `Enter` → [`NavDirection::Down`]
+///   - `Shift+Enter` → [`NavDirection::Up`]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavDirection {
+    Next,
+    Prev,
+    Down,
+    Up,
+}
+
+/// Result of a navigation query — `(row, col)` the caller should focus
+/// next, plus whether the model already had room for that cell or
+/// whether the caller needs to insert an empty row first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NavTarget {
+    pub row: i32,
+    pub col: usize,
+    /// `true` when the user navigated past the end of the body — the
+    /// caller should run `insert_empty_row(row)` before focusing.
+    pub created_row: bool,
+}
+
 /// Errors produced by the table subsystem.
 #[derive(Clone, Debug)]
 pub enum TableError {
@@ -227,6 +254,153 @@ impl MarkdownTable {
     ) -> Result<EditDelta> {
         crate::tables::serialize::update_cell(self, row, col, new_content, buffer)
     }
+
+    /// Insert an empty body row at the given 0-based index. Triggers
+    /// a structural re-serialize (Pretty for PreserveOriginal tables,
+    /// since we don't have an `OriginalLine` to splice). See
+    /// [`crate::tables::serialize`] for the implementation.
+    pub fn insert_empty_row(&mut self, at_index: usize, buffer: &mut String) -> Result<EditDelta> {
+        crate::tables::serialize::insert_empty_row(self, at_index, buffer)
+    }
+
+    /// Compute the navigation target for a Tab / Shift+Tab / Enter
+    /// / Shift+Enter press inside the cell at `(row, col)`.
+    ///
+    /// Pure logic — does not mutate the table. If
+    /// `result.created_row == true`, the caller is responsible for
+    /// running [`insert_empty_row`] at `result.row` before focusing.
+    ///
+    /// Convention: `row == -1` is the header. Behaviour:
+    ///
+    /// - **Next**: right one cell; wrap from header end to first body
+    ///   row; from end of last body row, signal `created_row` to
+    ///   append a new empty row.
+    /// - **Prev**: left one cell; wrap from start of a body row to
+    ///   end of previous row; from start of first body row to end of
+    ///   header. No-op at `(-1, 0)`.
+    /// - **Down**: same column, next row; signals `created_row` past
+    ///   the last body row.
+    /// - **Up**: same column, previous row; from first body row to
+    ///   header; no-op at the header.
+    ///
+    /// [`insert_empty_row`]: MarkdownTable::insert_empty_row
+    pub fn navigate(&self, row: i32, col: usize, dir: NavDirection) -> NavTarget {
+        let cols = self.alignments.len();
+        let body_rows = self.rows.len() as i32;
+        // Empty table guard — should be impossible for a parsed GFM
+        // table, but be defensive.
+        if cols == 0 {
+            return NavTarget {
+                row,
+                col,
+                created_row: false,
+            };
+        }
+        let last_col = cols - 1;
+        match dir {
+            NavDirection::Next => {
+                if col + 1 < cols {
+                    NavTarget {
+                        row,
+                        col: col + 1,
+                        created_row: false,
+                    }
+                } else if row == -1 {
+                    // End of header → first body cell. Append row if
+                    // body is empty.
+                    NavTarget {
+                        row: 0,
+                        col: 0,
+                        created_row: body_rows == 0,
+                    }
+                } else if row + 1 < body_rows {
+                    NavTarget {
+                        row: row + 1,
+                        col: 0,
+                        created_row: false,
+                    }
+                } else {
+                    // Tab at the very last cell → spreadsheet-style
+                    // "append a row" magic.
+                    NavTarget {
+                        row: body_rows,
+                        col: 0,
+                        created_row: true,
+                    }
+                }
+            }
+            NavDirection::Prev => {
+                if col > 0 {
+                    NavTarget {
+                        row,
+                        col: col - 1,
+                        created_row: false,
+                    }
+                } else if row > 0 {
+                    NavTarget {
+                        row: row - 1,
+                        col: last_col,
+                        created_row: false,
+                    }
+                } else if row == 0 {
+                    NavTarget {
+                        row: -1,
+                        col: last_col,
+                        created_row: false,
+                    }
+                } else {
+                    // At (-1, 0) — top-left of header; nowhere to go.
+                    NavTarget {
+                        row,
+                        col,
+                        created_row: false,
+                    }
+                }
+            }
+            NavDirection::Down => {
+                if row == -1 {
+                    NavTarget {
+                        row: 0,
+                        col,
+                        created_row: body_rows == 0,
+                    }
+                } else if row + 1 < body_rows {
+                    NavTarget {
+                        row: row + 1,
+                        col,
+                        created_row: false,
+                    }
+                } else {
+                    NavTarget {
+                        row: body_rows,
+                        col,
+                        created_row: true,
+                    }
+                }
+            }
+            NavDirection::Up => {
+                if row == -1 {
+                    NavTarget {
+                        row,
+                        col,
+                        created_row: false,
+                    }
+                } else if row == 0 {
+                    NavTarget {
+                        row: -1,
+                        col,
+                        created_row: false,
+                    }
+                } else {
+                    NavTarget {
+                        row: row - 1,
+                        col,
+                        created_row: false,
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +471,161 @@ mod tests {
         assert_eq!(t.headers[0].source_range, 1..7); // untouched
         assert_eq!(t.rows[0][0].source_range, 30..36); // +5
         assert_eq!(t.source_range, 0..45); // table end shifted
+    }
+
+    #[test]
+    fn navigate_next_advances_within_row() {
+        let t = sample_table();
+        let n = t.navigate(0, 0, NavDirection::Next);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: 0,
+                col: 1,
+                created_row: false
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_next_wraps_header_to_body() {
+        let t = sample_table();
+        let n = t.navigate(-1, 1, NavDirection::Next);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: 0,
+                col: 0,
+                created_row: false
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_next_at_last_cell_signals_new_row() {
+        let t = sample_table();
+        let n = t.navigate(0, 1, NavDirection::Next);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: 1,
+                col: 0,
+                created_row: true
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_prev_wraps_to_previous_row_end() {
+        let t = sample_table();
+        let n = t.navigate(0, 0, NavDirection::Prev);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: -1,
+                col: 1,
+                created_row: false
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_prev_no_op_at_top_left_of_header() {
+        let t = sample_table();
+        let n = t.navigate(-1, 0, NavDirection::Prev);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: -1,
+                col: 0,
+                created_row: false
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_down_appends_row_at_end() {
+        let t = sample_table();
+        let n = t.navigate(0, 1, NavDirection::Down);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: 1,
+                col: 1,
+                created_row: true
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_down_from_header_lands_in_body() {
+        let t = sample_table();
+        let n = t.navigate(-1, 0, NavDirection::Down);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: 0,
+                col: 0,
+                created_row: false
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_up_from_first_body_lands_in_header() {
+        let t = sample_table();
+        let n = t.navigate(0, 1, NavDirection::Up);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: -1,
+                col: 1,
+                created_row: false
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_handles_empty_body() {
+        // Header-only table.
+        let t = MarkdownTable {
+            rows: vec![],
+            ..sample_table()
+        };
+        let n = t.navigate(-1, 1, NavDirection::Next);
+        assert_eq!(
+            n,
+            NavTarget {
+                row: 0,
+                col: 0,
+                created_row: true
+            }
+        );
+    }
+
+    #[test]
+    fn navigate_single_column_table() {
+        // Only one column → Tab/Enter behave identically.
+        let t = MarkdownTable {
+            alignments: vec![Alignment::None],
+            headers: vec![Cell {
+                source_range: 1..3,
+                content: "a".into(),
+                leading_ws: 1,
+                trailing_ws: 1,
+            }],
+            rows: vec![vec![Cell {
+                source_range: 6..8,
+                content: "1".into(),
+                leading_ws: 1,
+                trailing_ws: 1,
+            }]],
+            ..sample_table()
+        };
+        let n = t.navigate(-1, 0, NavDirection::Next);
+        assert_eq!(n.row, 0);
+        assert_eq!(n.col, 0);
+        let n = t.navigate(0, 0, NavDirection::Next);
+        assert!(n.created_row);
     }
 }

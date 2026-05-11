@@ -158,6 +158,77 @@ pub fn to_gfm_preserve(table: &MarkdownTable, _buffer: &str) -> String {
     out
 }
 
+/// Insert an empty body row at `at_index`. Triggers a structural
+/// re-serialize: PreserveOriginal tables get promoted to Pretty just
+/// long enough to emit the new row (we don't have an `OriginalLine`
+/// for it), and `original_lines` is re-captured from the freshly
+/// written source so subsequent cell edits stay surgical.
+pub fn insert_empty_row(
+    table: &mut MarkdownTable,
+    at_index: usize,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    let cols = table.alignments.len();
+    if cols == 0 {
+        return Err(TableError::InvalidStructure(
+            "table has no columns".to_string(),
+        ));
+    }
+    if at_index > table.rows.len() {
+        return Err(TableError::CellOutOfRange {
+            row: at_index as i32,
+            col: 0,
+        });
+    }
+
+    let blank_row: Vec<Cell> = (0..cols)
+        .map(|_| Cell {
+            // Source ranges are filler — refresh_internal_ranges (called
+            // below) will re-derive them from the new source.
+            source_range: 0..0,
+            content: String::new(),
+            leading_ws: 1,
+            trailing_ws: 1,
+        })
+        .collect();
+    table.rows.insert(at_index, blank_row);
+
+    // Pick a temporary style for the re-serialise. PreserveOriginal
+    // can't carry a brand-new row through `to_gfm_preserve` (no
+    // OriginalLine to splice), so swap to Pretty for the emit.
+    let original_style = table.style;
+    let emit_style = match original_style {
+        TableStyle::PreserveOriginal => TableStyle::Pretty,
+        other => other,
+    };
+    table.style = emit_style;
+    let new_text = to_gfm(table, buffer);
+    table.style = original_style;
+
+    let old_range = table.source_range.clone();
+    let old_len = old_range.end - old_range.start;
+    let byte_delta = new_text.len() as isize - old_len as isize;
+
+    buffer.replace_range(old_range.clone(), &new_text);
+    table.source_range = old_range.start..(old_range.start + new_text.len());
+
+    // Refresh per-cell source ranges from the new bytes.
+    refresh_internal_ranges(table, buffer);
+
+    // Re-capture original_lines from the new source so PreserveOriginal
+    // works for *future* per-cell edits including in the new row.
+    if matches!(original_style, TableStyle::PreserveOriginal) {
+        let table_src = &buffer[table.source_range.clone()];
+        table.original_lines = Some(super::parse::capture_original_lines(table_src));
+    }
+
+    Ok(EditDelta {
+        byte_delta,
+        patched_range: old_range,
+        new_range: table.source_range.clone(),
+    })
+}
+
 /// Edit a single cell. Dispatches on table style; returns enough
 /// information for the caller to shift downstream tables.
 pub fn update_cell(
@@ -644,5 +715,61 @@ mod tests {
         // \ -> \\ first, then | -> \| → original literal backslash stays
         // distinguishable from an escape sequence.
         assert_eq!(escape_cell("a\\|b"), "a\\\\\\|b");
+    }
+
+    #[test]
+    fn insert_empty_row_appends_at_end() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        let before_rows = t.rows.len();
+        let delta = t.insert_empty_row(before_rows, &mut buffer).unwrap();
+        assert_eq!(t.rows.len(), before_rows + 1);
+        assert!(delta.byte_delta > 0);
+        // Buffer now has a new blank row line.
+        assert!(buffer.matches('\n').count() >= 4);
+    }
+
+    #[test]
+    fn insert_empty_row_at_middle_position() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n| 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.insert_empty_row(1, &mut buffer).unwrap();
+        assert_eq!(t.rows.len(), 3);
+        // The inserted row is at index 1 → empty.
+        assert!(t.rows[1].iter().all(|c| c.content.is_empty()));
+        // Surrounding rows are intact.
+        assert_eq!(t.rows[0][0].content, "1");
+        assert_eq!(t.rows[2][0].content, "2");
+    }
+
+    #[test]
+    fn insert_empty_row_in_preserve_table_recaptures_original_lines() {
+        let original = "| name  | score |\n|-------|------:|\n| Alice |    42 |\n";
+        let mut buffer = String::from(original);
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+
+        t.insert_empty_row(1, &mut buffer).unwrap();
+        assert_eq!(t.rows.len(), 2);
+        // Style stays PreserveOriginal even though we re-serialised
+        // through Pretty for the emit.
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        // original_lines re-captured against the new source.
+        assert!(t.original_lines.is_some());
+        // Subsequent cell edit should still work in PreserveOriginal mode.
+        t.update_cell(1, 0, "Bob", &mut buffer).unwrap();
+        assert!(buffer.contains("Bob"));
+    }
+
+    #[test]
+    fn insert_empty_row_out_of_range_errors() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        let err = t.insert_empty_row(99, &mut buffer).unwrap_err();
+        assert!(matches!(err, TableError::CellOutOfRange { .. }));
     }
 }

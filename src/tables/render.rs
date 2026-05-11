@@ -190,6 +190,11 @@ pub fn percent_encode(s: &str) -> String {
 /// table. Wires up click → contenteditable → blur/Enter/Tab/Esc →
 /// tab-delimited message to Rust. Idempotent on repeated injection
 /// (the IIFE bails when there's no `tableEdit` handler).
+///
+/// Exposes `window.rmdFocusCell(tableId, row, col)` so Rust can
+/// inject a one-shot script after `refresh_preview` to programmat-
+/// ically focus a target cell — used by the Tab/Enter navigation
+/// flow to keep the edit experience continuous across re-renders.
 pub const TABLE_EDIT_JS: &str = r#"
 <script>
 (function() {
@@ -198,6 +203,10 @@ pub const TABLE_EDIT_JS: &str = r#"
 
   var active = null;
   var originalRaw = "";
+  // Direction (next | prev | up | down) to navigate to after the
+  // current edit commits. Set by Tab / Shift+Tab / Enter / Shift+Enter
+  // and consumed by commitEdit, which fires the tableNavigate message.
+  var pendingNavigation = null;
 
   document.addEventListener("click", function(e) {
     if (!e.target.closest) return;
@@ -232,32 +241,39 @@ pub const TABLE_EDIT_JS: &str = r#"
   function commitEdit(td) {
     if (!td || td !== active) return;
     var newContent = (td.textContent || "").replace(/ /g, " ");
+    var navDirection = pendingNavigation;
+    pendingNavigation = null;
     td.contentEditable = "false";
     td.classList.remove("rmd-cell-editing");
 
-    if (newContent === originalRaw) {
-      // No change — put the rendered HTML back without a round trip.
+    var tableId = td.getAttribute("data-table-id");
+    var rowAttr = td.getAttribute("data-row");
+    var colAttr = td.getAttribute("data-col");
+
+    if (newContent !== originalRaw) {
+      // Content changed → send tableEdit. Rust applies + refreshes.
+      msg.tableEdit.postMessage(
+        tableId + "\t" + rowAttr + "\t" + colAttr + "\t" + newContent
+      );
+    } else {
+      // No change — restore rendered HTML without a round trip.
       td.innerHTML = td.dataset.renderedHtml || td.innerHTML;
       delete td.dataset.renderedHtml;
-      active = null;
-      return;
     }
-
-    // Tab-delimited like the existing image handlers.
-    msg.tableEdit.postMessage(
-      td.getAttribute("data-table-id") + "\t" +
-      td.getAttribute("data-row") + "\t" +
-      td.getAttribute("data-col") + "\t" +
-      newContent
-    );
-    // Rust applies the edit, then refresh_preview() re-renders the
-    // whole table with fresh data attributes. No more local DOM
-    // mutation needed.
     active = null;
+
+    if (navDirection && msg.tableNavigate) {
+      // Sequential message — Rust processes after tableEdit (if any)
+      // since both run on the main thread in order.
+      msg.tableNavigate.postMessage(
+        tableId + "\t" + rowAttr + "\t" + colAttr + "\t" + navDirection
+      );
+    }
   }
 
   function cancelEdit(td) {
     if (!td || td !== active) return;
+    pendingNavigation = null;
     td.contentEditable = "false";
     td.classList.remove("rmd-cell-editing");
     td.innerHTML = td.dataset.renderedHtml || td.textContent;
@@ -274,13 +290,14 @@ pub const TABLE_EDIT_JS: &str = r#"
       // Ctrl/Cmd+Enter → soft break (becomes <br> at commit time).
       document.execCommand("insertText", false, "\n");
       e.preventDefault();
-    } else if (e.key === "Enter" && !e.shiftKey) {
+    } else if (e.key === "Enter") {
       e.preventDefault();
+      pendingNavigation = e.shiftKey ? "up" : "down";
       commitEdit(active);
     } else if (e.key === "Tab") {
       e.preventDefault();
+      pendingNavigation = e.shiftKey ? "prev" : "next";
       commitEdit(active);
-      // Cell-to-cell Tab navigation is a follow-up commit.
     }
   });
 
@@ -294,6 +311,17 @@ pub const TABLE_EDIT_JS: &str = r#"
       }
     }, 0);
   });
+
+  // Programmatic focus for one-shot scripts injected by Rust after
+  // a Tab/Enter-driven navigation. Re-uses the click → beginEdit
+  // path so we don't duplicate setup logic.
+  window.rmdFocusCell = function(tableId, row, col) {
+    var sel = '.rmd-cell[data-table-id="' + tableId + '"]'
+            + '[data-row="' + row + '"][data-col="' + col + '"]';
+    var cell = document.querySelector(sel);
+    if (!cell) return;
+    cell.click();
+  };
 })();
 </script>
 "#;
