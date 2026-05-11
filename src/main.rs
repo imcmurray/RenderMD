@@ -19,6 +19,10 @@ use notify::Watcher;
 use sourceview5::prelude::*;
 use webkit6::prelude::*;
 
+// Table subsystem — parsed/edited independently of the main comrak
+// render path. See src/tables/mod.rs.
+mod tables;
+
 const APP_ID: &str = "io.github.rendermd.RenderMD";
 const APP_NAME: &str = "RenderMD";
 
