@@ -233,6 +233,54 @@ pub fn insert_column(
     re_serialize_structurally(table, buffer)
 }
 
+/// Force-reformat the table to pretty-aligned columns, recomputing
+/// widths from the current cell contents. Works on tables of any
+/// style — PreserveOriginal, Pretty, or Compact — and **leaves the
+/// table in PreserveOriginal mode against the newly-pretty source**
+/// so subsequent per-cell edits stay surgical.
+///
+/// The two-step "emit-as-Pretty, then track-as-PreserveOriginal"
+/// pattern is intentional: it gives the user the visual benefit of
+/// Pretty formatting (column-width alignment, normalised separator
+/// colons) for this one operation, while keeping editing cheap for
+/// the long tail of small edits that follow.
+///
+/// Idempotent: tables that already emit byte-identical Pretty
+/// output return an `EditDelta` whose patched range covers the full
+/// table but whose `byte_delta` is 0; the caller can choose to apply
+/// it (harmless) or short-circuit on zero-byte-delta if it wants to
+/// avoid the buffer event.
+pub fn reformat_pretty(table: &mut MarkdownTable, buffer: &mut String) -> Result<EditDelta> {
+    if table.alignments.is_empty() {
+        return Err(TableError::InvalidStructure(
+            "table has no columns".to_string(),
+        ));
+    }
+
+    // Force the emit through to_gfm_pretty regardless of prior style.
+    let new_text = to_gfm_pretty(table);
+
+    let old_range = table.source_range.clone();
+    let old_len = old_range.end - old_range.start;
+    let byte_delta = new_text.len() as isize - old_len as isize;
+
+    buffer.replace_range(old_range.clone(), &new_text);
+    table.source_range = old_range.start..(old_range.start + new_text.len());
+
+    refresh_internal_ranges(table, buffer);
+
+    // Track future edits as PreserveOriginal against the new bytes.
+    table.style = TableStyle::PreserveOriginal;
+    let table_src = &buffer[table.source_range.clone()];
+    table.original_lines = Some(super::parse::capture_original_lines(table_src));
+
+    Ok(EditDelta {
+        byte_delta,
+        patched_range: old_range,
+        new_range: table.source_range.clone(),
+    })
+}
+
 /// Set the column's alignment, rewriting the separator row so the
 /// new colons land in the right place. A no-op (same alignment as
 /// the current value) returns an `EditDelta` with an empty
@@ -997,6 +1045,95 @@ mod tests {
         // Per-cell edit still works in PreserveOriginal mode.
         t.update_cell(0, 0, "Bob", &mut buffer).unwrap();
         assert!(buffer.contains("Bob"));
+    }
+
+    #[test]
+    fn reformat_pretty_aligns_columns_from_compact_source() {
+        let original = "| a | name |\n|---|------|\n| x | longer cell |\n";
+        let mut buffer = String::from(original);
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.reformat_pretty(&mut buffer).unwrap();
+        // After reformat, header and body row should align pipe positions.
+        let lines: Vec<&str> = buffer.lines().collect();
+        let head_pipes: Vec<usize> = lines[0].match_indices('|').map(|(i, _)| i).collect();
+        let body_pipes: Vec<usize> = lines[2].match_indices('|').map(|(i, _)| i).collect();
+        assert_eq!(head_pipes, body_pipes);
+    }
+
+    #[test]
+    fn reformat_pretty_leaves_style_in_preserve_mode() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        t.reformat_pretty(&mut buffer).unwrap();
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        // original_lines re-captured from the new (pretty) source.
+        assert!(t.original_lines.is_some());
+    }
+
+    #[test]
+    fn reformat_pretty_then_cell_edit_is_minimum_diff() {
+        let mut buffer = String::from("| a | name |\n|---|------|\n| x | y |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.reformat_pretty(&mut buffer).unwrap();
+        // After reformat, an in-place cell edit shouldn't disturb other cells.
+        let before = buffer.clone();
+        t.update_cell(0, 0, "z", &mut buffer).unwrap();
+        // The unchanged cells (e.g., header) should be byte-identical.
+        let header_line_before = before.lines().next().unwrap();
+        let header_line_after = buffer.lines().next().unwrap();
+        assert_eq!(header_line_before, header_line_after);
+    }
+
+    #[test]
+    fn reformat_pretty_normalises_alignment_separator() {
+        // Three-dash separator → pretty re-emit should still encode
+        // alignment correctly even when widths grow.
+        let mut buffer = String::from("| name | score |\n|:--|--:|\n| Alice | 42 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.reformat_pretty(&mut buffer).unwrap();
+        // Left alignment: starting colon. Right alignment: trailing colon.
+        assert!(buffer.contains(":-"), "buffer: {buffer}");
+        assert!(buffer.contains("-:"), "buffer: {buffer}");
+    }
+
+    #[test]
+    fn reformat_pretty_idempotent_on_already_pretty() {
+        let mut buffer = String::from("| name  | score |\n|-------|-------|\n| Alice |    42 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        let first = buffer.clone();
+        t.reformat_pretty(&mut buffer).unwrap();
+        let after_first = buffer.clone();
+        // Second reformat should produce identical bytes.
+        let mut tables2 = parse_tables(&buffer);
+        tables2[0].reformat_pretty(&mut buffer).unwrap();
+        assert_eq!(buffer, after_first);
+        let _ = first;
+    }
+
+    #[test]
+    fn reformat_pretty_empty_columns_errors() {
+        // Build a degenerate table by hand — parser won't produce
+        // alignments.len() == 0, but the function should refuse anyway.
+        let mut table = MarkdownTable {
+            id: 1,
+            source_range: 0..0,
+            alignments: vec![],
+            headers: vec![],
+            rows: vec![],
+            style: TableStyle::PreserveOriginal,
+            column_widths: vec![],
+            formulas: Default::default(),
+            original_lines: None,
+        };
+        let mut buf = String::new();
+        let err = table.reformat_pretty(&mut buf).unwrap_err();
+        assert!(matches!(err, TableError::InvalidStructure(_)));
     }
 
     #[test]

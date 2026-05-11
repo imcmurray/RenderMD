@@ -299,6 +299,15 @@ impl MarkdownTable {
         crate::tables::serialize::set_column_alignment(self, col, alignment, buffer)
     }
 
+    /// Force-reformat the table with pretty column alignment,
+    /// recomputing widths from current cell contents. Leaves the
+    /// table in PreserveOriginal mode so subsequent per-cell edits
+    /// stay surgical against the now-pretty source. See
+    /// [`crate::tables::serialize::reformat_pretty`] for details.
+    pub fn reformat_pretty(&mut self, buffer: &mut String) -> Result<EditDelta> {
+        crate::tables::serialize::reformat_pretty(self, buffer)
+    }
+
     /// Compute the navigation target for a Tab / Shift+Tab / Enter
     /// / Shift+Enter press inside the cell at `(row, col)`.
     ///

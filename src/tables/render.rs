@@ -352,6 +352,18 @@ pub const TABLE_EDIT_JS: &str = r#"
     align.forEach(function(s) {
       addToolbarButton(s[0], s[1], s[2], true);
     });
+    // Reformat is always visible (independent of header/body), so
+    // give it its own thin divider so it doesn't crowd the L/C/R
+    // cluster when those are hidden for body cells.
+    var sep2 = document.createElement("div");
+    sep2.className = "rmd-table-toolbar-sep rmd-table-toolbar-sep-reformat";
+    toolbar.appendChild(sep2);
+    addToolbarButton(
+      "reformat",
+      "↔ Format",
+      "Reformat table to pretty alignment (Ctrl+Shift+Alt+T)",
+      false
+    );
     document.body.appendChild(toolbar);
     return toolbar;
   }
@@ -478,6 +490,9 @@ pub const TABLE_EDIT_JS: &str = r#"
     } else if (e.altKey && (e.key === "-" || e.key === "_")) {
       e.preventDefault();
       dispatchStructureOp("col-delete");
+    } else if (e.shiftKey && e.altKey && (e.key === "t" || e.key === "T")) {
+      e.preventDefault();
+      dispatchStructureOp("reformat");
     }
   });
 

@@ -2851,6 +2851,7 @@ impl State {
             "align-none" => {
                 table.set_column_alignment(col, tables::model::Alignment::None, &mut shadow)
             }
+            "reformat" => table.reformat_pretty(&mut shadow),
             _ => return,
         };
 
@@ -2904,6 +2905,17 @@ impl State {
             "align-left" | "align-center" | "align-right" | "align-none" => {
                 // Alignment doesn't change cell positions — stay on the
                 // header cell the user clicked.
+                Some((row, col))
+            }
+            "reformat" => {
+                // Cells keep their (row, col) addresses across a
+                // reformat; stay on the same one. Also surface a
+                // brief toast so the user sees what just happened.
+                self.show_toast(&format!(
+                    "Table reformatted to pretty style ({} column{})",
+                    n_cols,
+                    if n_cols == 1 { "" } else { "s" }
+                ));
                 Some((row, col))
             }
             _ => None,
