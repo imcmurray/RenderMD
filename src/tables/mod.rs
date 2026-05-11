@@ -41,6 +41,7 @@
 pub mod model;
 pub mod parse;
 pub mod paste;
+pub mod render;
 pub mod serialize;
 
 pub use model::{

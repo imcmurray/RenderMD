@@ -257,6 +257,17 @@ img {
 .rmd-img-dragging { opacity: 0.55; }
 .rmd-img-dragging .rmd-img-handle { display: none; }
 .rmd-img-dragging:hover { outline: 2px solid var(--accent); }
+.rmd-cell { cursor: text; transition: background 0.1s; }
+.rmd-cell:hover { background: rgba(127, 127, 127, 0.08); }
+.rmd-cell-editing {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--bg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  cursor: text;
+}
+.rmd-cell-editing:focus { outline-color: var(--accent); }
 .rmd-history-rail {
   position: fixed;
   left: 8px;
@@ -2562,6 +2573,7 @@ impl State {
         manager.register_script_message_handler("commitClick", None);
         manager.register_script_message_handler("toggleHistory", None);
         manager.register_script_message_handler("scrollTo", None);
+        manager.register_script_message_handler("tableEdit", None);
 
         let st = self.clone();
         manager.connect_script_message_received(Some("imageClick"), move |_, value| {
@@ -2583,6 +2595,94 @@ impl State {
         manager.connect_script_message_received(Some("toggleHistory"), move |_, _value| {
             st.action_toggle_history();
         });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("tableEdit"), move |_, value| {
+            st.handle_table_edit(&value.to_str());
+        });
+    }
+
+    /// Apply a click-to-edit cell commit from the WebView.
+    ///
+    /// Payload is tab-delimited `table_id\trow\tcol\tcontent`,
+    /// matching the existing image-handler protocol. The content
+    /// portion may contain literal newlines (Ctrl+Enter soft break) —
+    /// `splitn(4, '\t')` keeps them intact.
+    ///
+    /// The flow:
+    ///   1. Re-parse tables from the current buffer (cheap; pulldown-cmark
+    ///      is fast). Find the table whose id matches the click.
+    ///   2. Compute the patch by running `MarkdownTable::update_cell` on
+    ///      a *clone* of the buffer — gives us the precise byte range
+    ///      that changed without touching the real buffer.
+    ///   3. Apply the same patch to the `GtkTextBuffer` as a single
+    ///      atomic edit (delete + insert wrapped in
+    ///      `begin_user_action` / `end_user_action`) so undo treats
+    ///      the whole cell change as one step.
+    ///   4. Refresh the preview so the edited table re-renders with
+    ///      fresh `data-*` attributes.
+    fn handle_table_edit(&self, message: &str) {
+        let mut parts = message.splitn(4, '\t');
+        let table_id: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let row: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let col: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let content = parts.next().unwrap_or("");
+        if table_id == 0 {
+            return;
+        }
+
+        let buffer_text = self.buffer_text();
+        let mut tables = tables::parse_tables(&buffer_text);
+        let table = match tables.iter_mut().find(|t| t.id == table_id) {
+            Some(t) => t,
+            None => {
+                // Doc layout changed between render and click. Re-render
+                // to resync the WebView with the source.
+                self.show_toast("Couldn't locate that table — refreshing");
+                if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                    self.refresh_preview();
+                }
+                return;
+            }
+        };
+
+        // Compute the patch against a clone so we get the exact byte
+        // range without mutating the real source.
+        let mut shadow = buffer_text.clone();
+        let delta = match table.update_cell(row, col, content, &mut shadow) {
+            Ok(d) => d,
+            Err(e) => {
+                self.show_toast(&format!("Edit failed: {e}"));
+                return;
+            }
+        };
+        if delta.patched_range.start == delta.patched_range.end && delta.byte_delta == 0 {
+            // No-op edit (content identical) — nothing to do.
+            return;
+        }
+
+        // Translate byte offsets to char offsets for GtkTextIter.
+        let char_start = buffer_text[..delta.patched_range.start].chars().count() as i32;
+        let char_end = buffer_text[..delta.patched_range.end].chars().count() as i32;
+        let replacement = &shadow[delta.new_range.clone()];
+
+        let buf = &self.inner.buffer;
+        self.inner.suppress_modify.set(true);
+        buf.begin_user_action();
+        let mut start = buf.iter_at_offset(char_start);
+        let mut end = buf.iter_at_offset(char_end);
+        buf.delete(&mut start, &mut end);
+        let mut at = buf.iter_at_offset(char_start);
+        buf.insert(&mut at, replacement);
+        buf.end_user_action();
+        self.inner.suppress_modify.set(false);
+
+        if !self.inner.is_modified.get() {
+            self.inner.is_modified.set(true);
+            self.update_title();
+        }
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
     }
 
     fn handle_commit_click(&self, sha: &str) {
@@ -2969,6 +3069,22 @@ impl State {
             .unwrap_or_else(|| APP_NAME.to_string());
         let html = render_markdown_to_html(&text, Some(&base_dir), self.is_dark(), &title);
 
+        // Tables: parse from source (cheap) and post-process the
+        // rendered HTML to inject data-* attributes + the click-to-
+        // edit JS so cells become interactive in the live preview.
+        // No-op when the doc has no tables.
+        let parsed_tables = tables::parse_tables(&text);
+        let html_with_tables = if parsed_tables.is_empty() {
+            html
+        } else {
+            let injected = tables::render::inject_table_attrs(&html, &parsed_tables);
+            injected.replacen(
+                "</body>",
+                &format!("{}\n</body>", tables::render::TABLE_EDIT_JS),
+                1,
+            )
+        };
+
         // Inject the git history rail just before </body> when available.
         // Stays out of the way (no rail markup at all) when the file
         // isn't in a git repo.
@@ -2978,12 +3094,12 @@ impl State {
                 let rail =
                     build_history_rail_html(commits, viewing.as_deref(), s.history_visible.get());
                 if rail.is_empty() {
-                    html
+                    html_with_tables
                 } else {
-                    html.replacen("</body>", &format!("{}\n</body>", rail), 1)
+                    html_with_tables.replacen("</body>", &format!("{}\n</body>", rail), 1)
                 }
             }
-            None => html,
+            None => html_with_tables,
         };
 
         let path_str = base_dir.to_string_lossy();
