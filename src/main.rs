@@ -173,6 +173,12 @@ table th, table td {
   padding: 8px 14px;
   text-align: left;
 }
+/* Column alignment from the GFM separator row. The data-align
+   attribute is set by the post-processor; the attribute-selector
+   specificity outranks the bare `table td` rule above so the
+   left default doesn't fight column-specific alignment. */
+table th[data-align="center"], table td[data-align="center"] { text-align: center; }
+table th[data-align="right"], table td[data-align="right"] { text-align: right; }
 table tr:nth-child(2n) { background: var(--table-stripe); }
 table th { font-weight: 600; background: var(--table-stripe); }
 
@@ -4428,12 +4434,22 @@ impl State {
     fn do_undo(&self) {
         if self.inner.buffer.can_undo() {
             self.inner.buffer.undo();
+            // The buffer-changed signal does run, but on_buffer_changed
+            // only flips the dirty flag — it doesn't kick a preview
+            // refresh. After undoing a click-to-edit table change the
+            // user expects the WebView to revert too, so do it here.
+            if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                self.refresh_preview();
+            }
         }
     }
 
     fn do_redo(&self) {
         if self.inner.buffer.can_redo() {
             self.inner.buffer.redo();
+            if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                self.refresh_preview();
+            }
         }
     }
 

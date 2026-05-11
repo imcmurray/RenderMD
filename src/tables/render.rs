@@ -448,18 +448,21 @@ pub const TABLE_EDIT_JS: &str = r#"
       e.preventDefault();
       e.stopPropagation();
       if (!active) return;
-      var resolvedOp = action;
       if (kind === "sort") {
         // Tri-state cycle: read the cell's current state and pick
-        // the next one. Backend handles the actual reordering and
-        // the original-order snapshot.
+        // the next one. Sort flows through its own message handler
+        // (`tableSort`) — the structural-op channel doesn't know
+        // about "sort-*" verbs.
         var current = active.getAttribute("data-sort-dir") || "off";
         var next = current === "off" ? "asc"
                  : current === "asc" ? "desc"
                  : "off";
-        resolvedOp = "sort-" + next;
-      } else if (action.indexOf("align-") === 0
-                 && btn.classList.contains("rmd-table-toolbar-active")) {
+        dispatchSort(next);
+        return;
+      }
+      var resolvedOp = action;
+      if (action.indexOf("align-") === 0
+          && btn.classList.contains("rmd-table-toolbar-active")) {
         // Clicking the already-active alignment reverts to none.
         resolvedOp = "align-none";
       }
@@ -535,6 +538,29 @@ pub const TABLE_EDIT_JS: &str = r#"
     msg.tableStructure.postMessage(
       tableId + "\t" + rowAttr + "\t" + colAttr + "\t" + op
     );
+    active.contentEditable = "false";
+    active.classList.remove("rmd-cell-editing");
+    active = null;
+    pendingNavigation = null;
+    hideToolbar();
+  }
+  // Sort lives on its own handler — payload is
+  // `table_id\tcol\tdirection` and `direction` is "asc"|"desc"|"off"
+  // (matches handle_table_sort's parser). Any pending header-cell
+  // edit is committed first so the sort runs against the latest
+  // content.
+  function dispatchSort(direction) {
+    if (!active || !msg.tableSort) return;
+    var tableId = active.getAttribute("data-table-id");
+    var rowAttr = active.getAttribute("data-row");
+    var colAttr = active.getAttribute("data-col");
+    var newContent = (active.textContent || "").replace(/ /g, " ");
+    if (newContent !== originalRaw) {
+      msg.tableEdit.postMessage(
+        tableId + "\t" + rowAttr + "\t" + colAttr + "\t" + newContent
+      );
+    }
+    msg.tableSort.postMessage(tableId + "\t" + colAttr + "\t" + direction);
     active.contentEditable = "false";
     active.classList.remove("rmd-cell-editing");
     active = null;

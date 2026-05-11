@@ -475,8 +475,10 @@ pub fn update_cell(
 
 /// PreserveOriginal: patch only the cell's content range. Preserves
 /// the user's intra-cell whitespace and surrounding column padding
-/// when the new content fits the existing width; widens the cell if
-/// the new content is longer.
+/// when the new content fits the existing width. When the new
+/// content would *grow* the cell, falls through to a Pretty re-emit
+/// so the rest of the column re-pads to match (otherwise the pipes
+/// drift and the user sees a ragged table in the editor).
 fn update_cell_in_place(
     table: &mut MarkdownTable,
     row: i32,
@@ -485,6 +487,21 @@ fn update_cell_in_place(
     buffer: &mut String,
 ) -> Result<EditDelta> {
     let escaped = escape_cell(new_content);
+
+    // If the new content can't fit in this cell's current inner
+    // width, promote to a Pretty re-emit. The column-padding-aware
+    // emit keeps the whole table neat; sticking to in-place patching
+    // would leave the edited cell wider than its column neighbours.
+    {
+        let cell = table.cell(row, col)?;
+        let old_len = cell.source_range.end - cell.source_range.start;
+        let inner_existing = old_len
+            .saturating_sub(cell.leading_ws as usize)
+            .saturating_sub(cell.trailing_ws as usize);
+        if visual_width(&escaped) > inner_existing {
+            return update_cell_via_pretty_promotion(table, row, col, new_content, buffer);
+        }
+    }
 
     // Pull what we need from the cell, then drop the borrow before we
     // call shift_after (which needs &mut table).
@@ -537,6 +554,49 @@ fn update_cell_in_place(
         byte_delta,
         patched_range: old_range,
         new_range,
+    })
+}
+
+/// Cell edit on a PreserveOriginal table where the new content would
+/// grow the cell beyond its existing inner width. Promotes to a
+/// Pretty re-emit so the whole column re-pads, then re-captures
+/// `original_lines` against the new source — leaving the table back
+/// in PreserveOriginal mode for subsequent surgical edits.
+fn update_cell_via_pretty_promotion(
+    table: &mut MarkdownTable,
+    row: i32,
+    col: usize,
+    new_content: &str,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    table.cell_mut(row, col)?.content = new_content.to_string();
+
+    // Force-emit through to_gfm_pretty regardless of prior style.
+    let original_style = table.style;
+    table.style = TableStyle::Pretty;
+    let new_text = to_gfm(table, buffer);
+    table.style = original_style;
+
+    let old_range = table.source_range.clone();
+    let old_len = old_range.end - old_range.start;
+    let byte_delta = new_text.len() as isize - old_len as isize;
+
+    buffer.replace_range(old_range.clone(), &new_text);
+    table.source_range = old_range.start..(old_range.start + new_text.len());
+
+    refresh_internal_ranges(table, buffer);
+
+    // Keep PreserveOriginal mode alive against the freshly-pretty
+    // source so the next narrow edit lands surgically again.
+    if matches!(original_style, TableStyle::PreserveOriginal) {
+        let table_src = &buffer[table.source_range.clone()];
+        table.original_lines = Some(capture_original_lines(table_src));
+    }
+
+    Ok(EditDelta {
+        byte_delta,
+        patched_range: old_range,
+        new_range: table.source_range.clone(),
     })
 }
 
@@ -872,6 +932,29 @@ mod tests {
         // Cell source range must reflect the new length.
         let cell = t.cell(0, 0).unwrap();
         assert_eq!(&buffer[cell.source_range.clone()].trim(), &"Alexandra");
+    }
+
+    #[test]
+    fn update_cell_preserve_grow_keeps_column_pipes_aligned() {
+        // Before: pipes line up at fixed positions. After: a long
+        // edit should re-pad neighbours so pipes still line up,
+        // not leave the edited cell wider than its column siblings.
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.update_cell(0, 0, "much longer cell", &mut buffer)
+            .unwrap();
+
+        let lines: Vec<&str> = buffer.lines().collect();
+        // All four lines should have pipes at the same column positions.
+        let header_pipes: Vec<usize> = lines[0].match_indices('|').map(|(i, _)| i).collect();
+        for line in &lines[1..] {
+            let pipes: Vec<usize> = line.match_indices('|').map(|(i, _)| i).collect();
+            assert_eq!(
+                pipes, header_pipes,
+                "pipe positions drifted on line: {line}"
+            );
+        }
     }
 
     #[test]
