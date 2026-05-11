@@ -312,9 +312,129 @@ pub const TABLE_EDIT_JS: &str = r#"
     }, 0);
   });
 
+  // -- Floating toolbar for structural ops -----------------------
+  // Shown only while a cell is being edited. Mousedown is suppressed
+  // on the buttons so clicking one doesn't blur the cell first (which
+  // would commit + hide the toolbar before our handler runs).
+  var toolbar = null;
+  function buildToolbar() {
+    if (toolbar) return toolbar;
+    toolbar = document.createElement("div");
+    toolbar.className = "rmd-table-toolbar";
+    toolbar.style.display = "none";
+    var specs = [
+      ["row-above", "↱ Row", "Insert row above (Ctrl+Shift+↑)"],
+      ["row-below", "↵ Row", "Insert row below (Ctrl+Shift+↓)"],
+      ["col-left", "↰ Col", "Insert column left (Ctrl+Shift+←)"],
+      ["col-right", "↳ Col", "Insert column right (Ctrl+Shift+→)"],
+      ["row-delete", "− Row", "Delete row (Ctrl+Shift+-)"],
+      ["col-delete", "− Col", "Delete column (Ctrl+Alt+-)"],
+    ];
+    specs.forEach(function(s) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "rmd-table-toolbar-btn";
+      btn.setAttribute("data-action", s[0]);
+      btn.textContent = s[1];
+      btn.title = s[2];
+      // Stop mousedown from stealing focus from the editable cell.
+      btn.addEventListener("mousedown", function(e) { e.preventDefault(); });
+      btn.addEventListener("click", function(e) {
+        e.preventDefault();
+        e.stopPropagation();
+        dispatchStructureOp(s[0]);
+      });
+      toolbar.appendChild(btn);
+    });
+    document.body.appendChild(toolbar);
+    return toolbar;
+  }
+  function showToolbarForCell(cell) {
+    var tb = buildToolbar();
+    tb.style.display = "flex";
+    // Render once to measure, then position relative to the cell.
+    var cellRect = cell.getBoundingClientRect();
+    var tbRect = tb.getBoundingClientRect();
+    var top = Math.max(8, cellRect.top - tbRect.height - 6);
+    var left = Math.min(
+      Math.max(8, cellRect.right - tbRect.width),
+      window.innerWidth - tbRect.width - 8
+    );
+    tb.style.top = top + "px";
+    tb.style.left = left + "px";
+  }
+  function hideToolbar() {
+    if (toolbar) toolbar.style.display = "none";
+  }
+  function dispatchStructureOp(op) {
+    if (!active || !msg.tableStructure) return;
+    var tableId = active.getAttribute("data-table-id");
+    var rowAttr = active.getAttribute("data-row");
+    var colAttr = active.getAttribute("data-col");
+    // If there's a pending edit, commit it first so the structural op
+    // runs on the latest content. The webkit handler queue preserves
+    // order across these two messages.
+    var newContent = (active.textContent || "").replace(/ /g, " ");
+    if (newContent !== originalRaw) {
+      msg.tableEdit.postMessage(
+        tableId + "\t" + rowAttr + "\t" + colAttr + "\t" + newContent
+      );
+    }
+    msg.tableStructure.postMessage(
+      tableId + "\t" + rowAttr + "\t" + colAttr + "\t" + op
+    );
+    active.contentEditable = "false";
+    active.classList.remove("rmd-cell-editing");
+    active = null;
+    pendingNavigation = null;
+    hideToolbar();
+  }
+
+  // Show the toolbar on every beginEdit; hide on commit/cancel.
+  var _origBeginEdit = beginEdit;
+  beginEdit = function(td) {
+    _origBeginEdit(td);
+    showToolbarForCell(td);
+  };
+  var _origCommitEdit = commitEdit;
+  commitEdit = function(td) {
+    _origCommitEdit(td);
+    hideToolbar();
+  };
+  var _origCancelEdit = cancelEdit;
+  cancelEdit = function(td) {
+    _origCancelEdit(td);
+    hideToolbar();
+  };
+
+  // Keyboard shortcuts (active while a cell is being edited).
+  document.addEventListener("keydown", function(e) {
+    if (!active) return;
+    if (!(e.ctrlKey || e.metaKey)) return;
+    if (e.shiftKey && e.key === "ArrowDown") {
+      e.preventDefault();
+      dispatchStructureOp("row-below");
+    } else if (e.shiftKey && e.key === "ArrowUp") {
+      e.preventDefault();
+      dispatchStructureOp("row-above");
+    } else if (e.shiftKey && e.key === "ArrowRight") {
+      e.preventDefault();
+      dispatchStructureOp("col-right");
+    } else if (e.shiftKey && e.key === "ArrowLeft") {
+      e.preventDefault();
+      dispatchStructureOp("col-left");
+    } else if (e.shiftKey && (e.key === "-" || e.key === "_")) {
+      e.preventDefault();
+      dispatchStructureOp("row-delete");
+    } else if (e.altKey && (e.key === "-" || e.key === "_")) {
+      e.preventDefault();
+      dispatchStructureOp("col-delete");
+    }
+  });
+
   // Programmatic focus for one-shot scripts injected by Rust after
-  // a Tab/Enter-driven navigation. Re-uses the click → beginEdit
-  // path so we don't duplicate setup logic.
+  // a Tab/Enter-driven navigation or a structural op. Re-uses the
+  // click → beginEdit path so we don't duplicate setup logic.
   window.rmdFocusCell = function(tableId, row, col) {
     var sel = '.rmd-cell[data-table-id="' + tableId + '"]'
             + '[data-row="' + row + '"][data-col="' + col + '"]';

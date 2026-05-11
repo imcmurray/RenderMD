@@ -263,6 +263,30 @@ impl MarkdownTable {
         crate::tables::serialize::insert_empty_row(self, at_index, buffer)
     }
 
+    /// Delete the body row at `row_index`. Header is never removed
+    /// this way (caller should refuse `row == -1` upstream).
+    pub fn delete_row(&mut self, row_index: usize, buffer: &mut String) -> Result<EditDelta> {
+        crate::tables::serialize::delete_row(self, row_index, buffer)
+    }
+
+    /// Insert an empty column at `at_index` with the given alignment.
+    /// Header, body rows, alignments, and column_widths all get the
+    /// new column.
+    pub fn insert_column(
+        &mut self,
+        at_index: usize,
+        alignment: Alignment,
+        buffer: &mut String,
+    ) -> Result<EditDelta> {
+        crate::tables::serialize::insert_column(self, at_index, alignment, buffer)
+    }
+
+    /// Delete the column at `col_index`. Refuses to remove the last
+    /// remaining column.
+    pub fn delete_column(&mut self, col_index: usize, buffer: &mut String) -> Result<EditDelta> {
+        crate::tables::serialize::delete_column(self, col_index, buffer)
+    }
+
     /// Compute the navigation target for a Tab / Shift+Tab / Enter
     /// / Shift+Enter press inside the cell at `(row, col)`.
     ///

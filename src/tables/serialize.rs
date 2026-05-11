@@ -180,22 +180,110 @@ pub fn insert_empty_row(
             col: 0,
         });
     }
-
-    let blank_row: Vec<Cell> = (0..cols)
-        .map(|_| Cell {
-            // Source ranges are filler — refresh_internal_ranges (called
-            // below) will re-derive them from the new source.
-            source_range: 0..0,
-            content: String::new(),
-            leading_ws: 1,
-            trailing_ws: 1,
-        })
-        .collect();
+    let blank_row: Vec<Cell> = (0..cols).map(|_| blank_cell()).collect();
     table.rows.insert(at_index, blank_row);
+    re_serialize_structurally(table, buffer)
+}
 
-    // Pick a temporary style for the re-serialise. PreserveOriginal
-    // can't carry a brand-new row through `to_gfm_preserve` (no
-    // OriginalLine to splice), so swap to Pretty for the emit.
+/// Remove the body row at `row_index`. Leaves the header intact; an
+/// empty `rows` is allowed (header-only table). Returns the patch
+/// info so the caller can shift downstream tables.
+pub fn delete_row(
+    table: &mut MarkdownTable,
+    row_index: usize,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    if row_index >= table.rows.len() {
+        return Err(TableError::CellOutOfRange {
+            row: row_index as i32,
+            col: 0,
+        });
+    }
+    table.rows.remove(row_index);
+    re_serialize_structurally(table, buffer)
+}
+
+/// Insert an empty column at `at_index`. Affects header, alignments,
+/// column_widths, and every body row (short rows are padded with
+/// blanks as needed before the insert).
+pub fn insert_column(
+    table: &mut MarkdownTable,
+    at_index: usize,
+    alignment: Alignment,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    let cols = table.alignments.len();
+    if at_index > cols {
+        return Err(TableError::CellOutOfRange {
+            row: -1,
+            col: at_index,
+        });
+    }
+    table.alignments.insert(at_index, alignment);
+    table.headers.insert(at_index, blank_cell());
+    for row in &mut table.rows {
+        // Pad row up to at_index if it's shorter than the new
+        // table width, then splice in the empty cell.
+        while row.len() < at_index {
+            row.push(blank_cell());
+        }
+        row.insert(at_index, blank_cell());
+    }
+    table.column_widths.insert(at_index, None);
+    re_serialize_structurally(table, buffer)
+}
+
+/// Remove the column at `col_index` from header, alignments,
+/// column_widths, and every body row that has a cell at that index.
+/// Refuses to remove the last column (would leave an invalid table).
+pub fn delete_column(
+    table: &mut MarkdownTable,
+    col_index: usize,
+    buffer: &mut String,
+) -> Result<EditDelta> {
+    let cols = table.alignments.len();
+    if cols <= 1 {
+        return Err(TableError::InvalidStructure(
+            "can't delete the only column".to_string(),
+        ));
+    }
+    if col_index >= cols {
+        return Err(TableError::CellOutOfRange {
+            row: -1,
+            col: col_index,
+        });
+    }
+    table.alignments.remove(col_index);
+    table.headers.remove(col_index);
+    for row in &mut table.rows {
+        if col_index < row.len() {
+            row.remove(col_index);
+        }
+    }
+    if col_index < table.column_widths.len() {
+        table.column_widths.remove(col_index);
+    }
+    re_serialize_structurally(table, buffer)
+}
+
+fn blank_cell() -> Cell {
+    Cell {
+        // Source ranges are filler — refresh_internal_ranges (called
+        // by re_serialize_structurally) will re-derive them from the
+        // new source.
+        source_range: 0..0,
+        content: String::new(),
+        leading_ws: 1,
+        trailing_ws: 1,
+    }
+}
+
+/// Shared finalizer for structural edits: re-emit the table block
+/// (Pretty for emit even if the table is PreserveOriginal), splice
+/// into the buffer, refresh internal source ranges, and re-capture
+/// `original_lines` against the new source so future per-cell edits
+/// in PreserveOriginal mode resume working surgically.
+fn re_serialize_structurally(table: &mut MarkdownTable, buffer: &mut String) -> Result<EditDelta> {
     let original_style = table.style;
     let emit_style = match original_style {
         TableStyle::PreserveOriginal => TableStyle::Pretty,
@@ -212,11 +300,8 @@ pub fn insert_empty_row(
     buffer.replace_range(old_range.clone(), &new_text);
     table.source_range = old_range.start..(old_range.start + new_text.len());
 
-    // Refresh per-cell source ranges from the new bytes.
     refresh_internal_ranges(table, buffer);
 
-    // Re-capture original_lines from the new source so PreserveOriginal
-    // works for *future* per-cell edits including in the new row.
     if matches!(original_style, TableStyle::PreserveOriginal) {
         let table_src = &buffer[table.source_range.clone()];
         table.original_lines = Some(super::parse::capture_original_lines(table_src));
@@ -771,5 +856,131 @@ mod tests {
         let t = &mut tables[0];
         let err = t.insert_empty_row(99, &mut buffer).unwrap_err();
         assert!(matches!(err, TableError::CellOutOfRange { .. }));
+    }
+
+    #[test]
+    fn delete_row_removes_target() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n| 2 |\n| 3 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.delete_row(1, &mut buffer).unwrap();
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0][0].content, "1");
+        assert_eq!(t.rows[1][0].content, "3");
+    }
+
+    #[test]
+    fn delete_last_row_leaves_header_only_table() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.delete_row(0, &mut buffer).unwrap();
+        assert_eq!(t.rows.len(), 0);
+        assert!(buffer.contains("| a |") || buffer.contains("|a|") || buffer.contains("| a"));
+    }
+
+    #[test]
+    fn delete_row_out_of_range_errors() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        assert!(matches!(
+            t.delete_row(5, &mut buffer).unwrap_err(),
+            TableError::CellOutOfRange { .. }
+        ));
+    }
+
+    #[test]
+    fn insert_column_at_end_adds_to_header_and_body() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.insert_column(2, Alignment::None, &mut buffer).unwrap();
+        assert_eq!(t.alignments.len(), 3);
+        assert_eq!(t.headers.len(), 3);
+        assert_eq!(t.rows[0].len(), 3);
+        assert!(t.headers[2].content.is_empty());
+    }
+
+    #[test]
+    fn insert_column_at_start_shifts_existing_cells_right() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.insert_column(0, Alignment::None, &mut buffer).unwrap();
+        assert_eq!(t.headers[0].content, "");
+        assert_eq!(t.headers[1].content, "a");
+        assert_eq!(t.rows[0][1].content, "1");
+    }
+
+    #[test]
+    fn insert_column_with_alignment_preserved_in_separator() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.insert_column(1, Alignment::Right, &mut buffer).unwrap();
+        // Right alignment renders the separator with a trailing colon.
+        assert!(buffer.contains("-:"), "buffer: {buffer}");
+    }
+
+    #[test]
+    fn delete_column_removes_from_header_and_body() {
+        let mut buffer = String::from("| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        t.delete_column(1, &mut buffer).unwrap();
+        assert_eq!(t.headers.len(), 2);
+        assert_eq!(t.headers[0].content, "a");
+        assert_eq!(t.headers[1].content, "c");
+        assert_eq!(t.rows[0].len(), 2);
+        assert_eq!(t.rows[0][1].content, "3");
+    }
+
+    #[test]
+    fn delete_only_column_refused() {
+        let mut buffer = String::from("| a |\n|---|\n| 1 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        let err = t.delete_column(0, &mut buffer).unwrap_err();
+        assert!(matches!(err, TableError::InvalidStructure(_)));
+        // Table unchanged.
+        assert_eq!(t.headers.len(), 1);
+    }
+
+    #[test]
+    fn delete_column_out_of_range_errors() {
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        let err = t.delete_column(99, &mut buffer).unwrap_err();
+        assert!(matches!(err, TableError::CellOutOfRange { .. }));
+    }
+
+    #[test]
+    fn structural_op_preserves_preserve_original_style() {
+        let mut buffer = String::from("| name  | score |\n|-------|------:|\n| Alice |    42 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        t.insert_column(2, Alignment::None, &mut buffer).unwrap();
+        assert_eq!(t.style, TableStyle::PreserveOriginal);
+        // original_lines re-captured against the new source.
+        assert!(t.original_lines.is_some());
+        // Per-cell edit still works in PreserveOriginal mode.
+        t.update_cell(0, 0, "Bob", &mut buffer).unwrap();
+        assert!(buffer.contains("Bob"));
+    }
+
+    #[test]
+    fn insert_column_pads_short_rows() {
+        // Hand-crafted: parser never produces ragged rows but model
+        // could after a sequence of edits. Defensive.
+        let mut buffer = String::from("| a | b |\n|---|---|\n| 1 | 2 |\n");
+        let mut tables = parse_tables(&buffer);
+        let t = &mut tables[0];
+        // Artificially make a row short to exercise the padding path.
+        t.rows[0].pop();
+        t.insert_column(2, Alignment::None, &mut buffer).unwrap();
+        assert_eq!(t.rows[0].len(), 3);
     }
 }

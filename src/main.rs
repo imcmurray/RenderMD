@@ -268,6 +268,34 @@ img {
   cursor: text;
 }
 .rmd-cell-editing:focus { outline-color: var(--accent); }
+.rmd-table-toolbar {
+  position: fixed;
+  z-index: 60;
+  display: none;
+  flex-direction: row;
+  gap: 2px;
+  padding: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+  font-size: 0.8em;
+  user-select: none;
+}
+.rmd-table-toolbar-btn {
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+  white-space: nowrap;
+}
+.rmd-table-toolbar-btn:hover {
+  background: rgba(127, 127, 127, 0.14);
+  color: var(--accent);
+}
 .rmd-history-rail {
   position: fixed;
   left: 8px;
@@ -2693,6 +2721,7 @@ impl State {
         manager.register_script_message_handler("scrollTo", None);
         manager.register_script_message_handler("tableEdit", None);
         manager.register_script_message_handler("tableNavigate", None);
+        manager.register_script_message_handler("tableStructure", None);
 
         let st = self.clone();
         manager.connect_script_message_received(Some("imageClick"), move |_, value| {
@@ -2722,6 +2751,131 @@ impl State {
         manager.connect_script_message_received(Some("tableNavigate"), move |_, value| {
             st.handle_table_navigate(&value.to_str());
         });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("tableStructure"), move |_, value| {
+            st.handle_table_structure(&value.to_str());
+        });
+    }
+
+    /// Apply a structural edit (insert/delete row, insert/delete
+    /// column) to the table the click-to-edit cell belongs to.
+    ///
+    /// Payload is tab-delimited `table_id\trow\tcol\top` where `op`
+    /// is one of `row-above` | `row-below` | `col-left` | `col-right`
+    /// | `row-delete` | `col-delete`. The `(row, col)` is the cell
+    /// that was focused when the user triggered the op.
+    ///
+    /// After the structural change, computes a sensible post-op
+    /// focus cell and stashes it in `pending_focus_cell` so the next
+    /// `refresh_preview` lands the user on a meaningful cell (e.g.
+    /// after "Insert row below" they stay on the same row index;
+    /// after "Delete row" they move to whatever is now in that
+    /// slot, or the previous row when they deleted the last one).
+    fn handle_table_structure(&self, message: &str) {
+        let mut parts = message.splitn(4, '\t');
+        let table_id: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let row: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let col: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let op = parts.next().unwrap_or("");
+        if table_id == 0 || op.is_empty() {
+            return;
+        }
+
+        let buffer_text = self.buffer_text();
+        let mut tables_vec = tables::parse_tables(&buffer_text);
+        let table = match tables_vec.iter_mut().find(|t| t.id == table_id) {
+            Some(t) => t,
+            None => {
+                self.show_toast("Couldn't locate that table — refreshing");
+                if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+                    self.refresh_preview();
+                }
+                return;
+            }
+        };
+
+        // `row == -1` indicates the header. For "row-below" the
+        // insertion index is 0 (start of body); for "row-above"
+        // we refuse — the header isn't a "row" the user can insert
+        // above. row-delete on the header is also refused.
+        let body_row = row.max(0) as usize;
+        let mut shadow = buffer_text.clone();
+        let result = match op {
+            "row-above" => {
+                if row == -1 {
+                    self.show_toast("Can't insert a row above the header");
+                    return;
+                }
+                table.insert_empty_row(body_row, &mut shadow)
+            }
+            "row-below" => {
+                let at = if row == -1 { 0 } else { body_row + 1 };
+                table.insert_empty_row(at, &mut shadow)
+            }
+            "col-left" => table.insert_column(col, tables::model::Alignment::None, &mut shadow),
+            "col-right" => {
+                table.insert_column(col + 1, tables::model::Alignment::None, &mut shadow)
+            }
+            "row-delete" => {
+                if row == -1 {
+                    self.show_toast("Can't delete the header row");
+                    return;
+                }
+                table.delete_row(body_row, &mut shadow)
+            }
+            "col-delete" => table.delete_column(col, &mut shadow),
+            _ => return,
+        };
+
+        let delta = match result {
+            Ok(d) => d,
+            Err(e) => {
+                self.show_toast(&format!("Operation failed: {e}"));
+                return;
+            }
+        };
+
+        self.apply_buffer_patch(&buffer_text, &shadow, &delta);
+
+        // Where should focus land after this op? Use the model's
+        // *post-op* sizes (table has been mutated in place by the
+        // op above).
+        let n_cols = table.alignments.len();
+        let n_body = table.rows.len() as i32;
+        let focus: Option<(i32, usize)> = match op {
+            "row-above" => Some((row + 1, col)),
+            "row-below" => {
+                // If we were on the header, land in the new first body row.
+                let target = if row == -1 { 0 } else { row };
+                Some((target, col))
+            }
+            "col-left" => Some((row, col + 1)),
+            "col-right" => Some((row, col)),
+            "row-delete" => {
+                if n_body == 0 {
+                    Some((-1, col)) // header-only table now
+                } else {
+                    let new_row = row.min(n_body - 1);
+                    Some((new_row, col))
+                }
+            }
+            "col-delete" => {
+                if n_cols == 0 {
+                    None
+                } else {
+                    let new_col = col.min(n_cols - 1);
+                    Some((row, new_col))
+                }
+            }
+            _ => None,
+        };
+        if let Some((fr, fc)) = focus {
+            *self.inner.pending_focus_cell.borrow_mut() = Some((table_id, fr, fc));
+        }
+
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
     }
 
     /// Splice a table-subsystem patch into the GtkTextBuffer as a
