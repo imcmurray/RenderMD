@@ -691,9 +691,39 @@ const IMAGE_CLICK_JS: &str = r#"<script>
 </script>
 "#;
 
-// Mermaid.js UMD bundle, embedded so preview works offline. Only injected
-// into the page when the document actually contains a mermaid fence.
+// Mermaid.js UMD bundle, embedded so preview works offline. Extracted to a
+// cache file on first use; the preview pulls it in via <script src=...>.
+// (Inlining a 3MB <script> alongside a <table> wedges WebKitGTK — see
+// `ensure_mermaid_bundle_uri`.)
 const MERMAID_BUNDLE: &str = include_str!("../data/js/mermaid.min.js");
+
+/// Write the embedded mermaid bundle to a stable cache path on first call,
+/// return a `file://` URI pointing at it. The cached file is keyed by the
+/// bundle's content length so a build with an updated bundle gets its own
+/// path and old copies become harmless.
+///
+/// Why external: WebKitGTK wedges when a multi-megabyte inline `<script>`
+/// shares the body with a `<table>` and another `<script>` follows. The
+/// WebProcess pegs CPU and grows memory until OOM. Loading the bundle as
+/// an external resource side-steps that pathology.
+fn ensure_mermaid_bundle_uri() -> String {
+    use std::sync::OnceLock;
+    static URI: OnceLock<String> = OnceLock::new();
+    URI.get_or_init(|| {
+        let cache = glib::user_cache_dir().join("rendermd");
+        let _ = std::fs::create_dir_all(&cache);
+        let path = cache.join(format!("mermaid-{}.min.js", MERMAID_BUNDLE.len()));
+        if !path.exists() {
+            // Best-effort: failure here surfaces as a missing diagram in the
+            // preview, not a crash. Writing 3MB once per cache-miss is fast.
+            let _ = std::fs::write(&path, MERMAID_BUNDLE);
+        }
+        let escaped =
+            glib::Uri::escape_string(&path.to_string_lossy(), Some("/"), false).to_string();
+        format!("file://{}", escaped)
+    })
+    .clone()
+}
 
 const MERMAID_INIT_JS: &str = r#"
 (function() {
@@ -2108,6 +2138,10 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
     options.parse.smart = true;
     options.render.unsafe_ = true;
     options.render.github_pre_lang = true;
+    // Emit `data-sourcepos="L:C-L:C"` on every block element. The mode
+    // toggle uses these to scroll the source view to the line under the
+    // top-most visible preview block (and vice-versa for the reverse path).
+    options.render.sourcepos = true;
 
     // Pick a syntect theme that flips with light/dark.
     let theme = if dark {
@@ -2127,13 +2161,16 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
     let mermaid_script = if had_mermaid {
         let theme = if dark { "dark" } else { "default" };
         let init = MERMAID_INIT_JS.replace("{THEME}", theme);
-        let mut s = String::with_capacity(MERMAID_BUNDLE.len() + init.len() + 40);
-        s.push_str("<script>");
-        s.push_str(MERMAID_BUNDLE);
-        s.push_str("</script>\n<script>");
-        s.push_str(&init);
-        s.push_str("</script>");
-        s
+        // Reference the bundle via <script src=...> rather than inlining it.
+        // Inlining a 3MB <script> alongside a <table> in the body triggers a
+        // WebKitGTK pathology where the WebProcess pegs CPU and grows memory
+        // unboundedly until OOM. Loading the bundle as an external file via
+        // a separate request avoids that interaction entirely.
+        let bundle_uri = ensure_mermaid_bundle_uri();
+        format!(
+            "<script src=\"{}\"></script>\n<script>{}</script>",
+            bundle_uri, init
+        )
     } else {
         String::new()
     };
@@ -2159,6 +2196,7 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
         html_escape(title)
     };
 
+    let image_js = IMAGE_CLICK_JS;
     HTML_TEMPLATE
         .replace("{TITLE}", &title_safe)
         .replace("{THEME_CSS}", theme_css)
@@ -2166,7 +2204,7 @@ fn render_markdown_to_html(text: &str, base_dir: Option<&Path>, dark: bool, titl
         .replace("{BASE_HREF}", &base_href)
         .replace("{BODY}", &body)
         .replace("{MERMAID_SCRIPT}", &mermaid_script)
-        .replace("{IMAGE_CLICK_JS}", IMAGE_CLICK_JS)
+        .replace("{IMAGE_CLICK_JS}", image_js)
 }
 
 // ---- App state --------------------------------------------------------------
@@ -2217,6 +2255,12 @@ struct StateInner {
     // (programmatically click) once the new HTML loads, so Tab/Enter
     // navigation between cells feels continuous to the user.
     pending_focus_cell: RefCell<Option<(tables::TableId, i32, usize)>>,
+
+    // Edit → Preview scroll sync: when the user toggles modes, the source
+    // line under the cursor goes here, and the next refresh_preview injects
+    // a one-shot script that scrolls the rendered block matching that line
+    // into view. 1-based to match comrak's `data-sourcepos`.
+    pending_scroll_line: Cell<Option<u32>>,
 
     // Per-table sort state — stores the snapshot of pre-sort rows
     // plus the current (col, direction). Consulted by:
@@ -2289,6 +2333,7 @@ impl State {
             viewing_snapshot: RefCell::new(None),
             history_visible: Cell::new(true),
             pending_focus_cell: RefCell::new(None),
+            pending_scroll_line: Cell::new(None),
             table_sort_snapshots: RefCell::new(HashMap::new()),
             toggle_handler: RefCell::new(None),
             buffer_handler: RefCell::new(None),
@@ -3668,13 +3713,26 @@ impl State {
     // -- Mode switching --------------------------------------------------
     fn set_mode(&self, mode: &str, force: bool) {
         let s = &self.inner;
-        if !force && s.mode.borrow().as_str() == mode {
+        let old_mode = s.mode.borrow().clone();
+        if !force && old_mode.as_str() == mode {
             return;
         }
+        // Sync scroll position on user-initiated toggles. `force=true` is
+        // used for programmatic transitions (file open, initial state) where
+        // there's no meaningful "previous position" to carry over.
+        let sync_scroll = !force && old_mode.as_str() != mode;
         match mode {
             MODE_PREVIEW => {
-                self.refresh_preview();
+                if sync_scroll && old_mode.as_str() == MODE_EDIT {
+                    s.pending_scroll_line
+                        .set(Some(self.top_visible_source_line_1based()));
+                }
+                // Stack switch FIRST so the WebView has real viewport
+                // dimensions by the time the new HTML's scroll-sync script
+                // runs. Otherwise window.scrollTo silently clamps to 0
+                // against a 0×0 hidden view and the preview lands at top.
                 s.stack.set_visible_child_name(MODE_PREVIEW);
+                self.refresh_preview();
                 s.toggle_icon.set_icon_name(Some("document-edit-symbolic"));
                 s.toggle_label.set_text("Edit");
                 s.status_mode.set_text("Preview");
@@ -3688,6 +3746,11 @@ impl State {
                 glib::idle_add_local_once(move || {
                     view.grab_focus();
                 });
+                if sync_scroll && old_mode.as_str() == MODE_PREVIEW {
+                    // Async: read the preview's top-visible source line,
+                    // then jump the source view there.
+                    self.sync_edit_to_preview_scroll();
+                }
             }
             _ => return,
         }
@@ -3701,6 +3764,100 @@ impl State {
         } else {
             s.toggle_btn.set_active(mode == MODE_EDIT);
         }
+    }
+
+    /// 1-based line number at the top of the source view's visible area.
+    /// We anchor the Edit → Preview scroll on what the user is actually
+    /// looking at rather than where the cursor happens to be — otherwise
+    /// scrolling without clicking first would snap the preview back to
+    /// wherever the cursor was last left.
+    /// Captures the source view's scroll anchor for an Edit → Preview
+    /// transition. Returns 0 when the view is scrolled to its end — a
+    /// sentinel that tells the preview side to also pin to the bottom,
+    /// instead of trying to land a specific line at the top (which would
+    /// clamp and drift earlier each cycle).
+    fn top_visible_source_line_1based(&self) -> u32 {
+        let view = &self.inner.source_view;
+        let Some(adj) = view.vadjustment() else {
+            return 1;
+        };
+        let value = adj.value();
+        if value + adj.page_size() >= adj.upper() - 2.0 {
+            return 0;
+        }
+        let (iter, _) = view.line_at_y(value.max(0.0) as i32);
+        let line = (iter.line() + 1).max(1) as u32;
+        if std::env::var_os("RMD_DEBUG_SCROLL").is_some() {
+            eprintln!("[scroll] vadj_y={} line={}", value as i32, line);
+        }
+        line
+    }
+
+    /// Async: query the preview WebView for the source line of the topmost
+    /// visible block (or -1 when the preview is scrolled to its end), then
+    /// scroll the source view to match.
+    fn sync_edit_to_preview_scroll(&self) {
+        const JS: &str = r#"(function(){
+          var doc = document.documentElement;
+          if (window.scrollY + window.innerHeight >= doc.scrollHeight - 2) return -1;
+          var els = document.querySelectorAll('[data-sourcepos]');
+          for (var i = 0; i < els.length; i++) {
+            var r = els[i].getBoundingClientRect();
+            if (r.height === 0) continue;
+            if (r.bottom > 0) {
+              var m = (els[i].getAttribute('data-sourcepos') || '').match(/^(\d+):/);
+              return m ? parseInt(m[1], 10) : 0;
+            }
+          }
+          return 0;
+        })()"#;
+        let state = self.clone();
+        self.inner.webview.evaluate_javascript(
+            JS,
+            None,
+            None,
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Ok(val) = result else { return };
+                if !val.is_number() {
+                    return;
+                }
+                let line = val.to_int32();
+                if line == -1 {
+                    state.scroll_source_to_end();
+                } else if line >= 1 {
+                    state.scroll_source_to_line(line as u32 - 1);
+                }
+            },
+        );
+    }
+
+    /// Scroll the source view so the 0-based `line` is at the very top of
+    /// the viewport. `yalign = 0` (not 0.15) so a Preview ↔ Edit round-trip
+    /// re-captures the same line on the next toggle instead of drifting
+    /// upward each cycle.
+    fn scroll_source_to_line(&self, line: u32) {
+        let s = &self.inner;
+        let buf = &s.buffer;
+        let line = (line as i32).min(buf.line_count().saturating_sub(1).max(0));
+        let Some(iter) = buf.iter_at_line(line) else {
+            return;
+        };
+        buf.place_cursor(&iter);
+        s.source_view
+            .scroll_to_mark(&buf.get_insert(), 0.0, true, 0.0, 0.0);
+    }
+
+    /// Pin the source view to its end. Matches the "scrolled to bottom"
+    /// anchor we use on the preview side, so cycling Preview ↔ Edit at the
+    /// document tail stays at the tail.
+    fn scroll_source_to_end(&self) {
+        let buf = &self.inner.buffer;
+        let iter = buf.end_iter();
+        buf.place_cursor(&iter);
+        self.inner
+            .source_view
+            .scroll_to_mark(&buf.get_insert(), 0.0, true, 0.0, 1.0);
     }
 
     fn action_toggle(&self) {
@@ -3821,9 +3978,67 @@ impl State {
             final_html
         };
 
+        // Edit → Preview scroll sync. `line == 0` is the "scrolled to end"
+        // sentinel set by top_visible_source_line_1based; everything else
+        // is a 1-based source line to land at the top of the viewport.
+        // align=0 (no 15% offset) keeps Preview ↔ Edit round-trips stable
+        // — re-capturing on the next toggle hits the same line instead of
+        // drifting upward each cycle. Re-applies on `load` and short
+        // timers so mermaid SVGs / late image loads can't push the target
+        // offscreen.
+        let final_html = if let Some(line) = s.pending_scroll_line.take() {
+            let body = if line == 0 {
+                String::from(
+                    r#"function go(){ window.scrollTo(0, document.documentElement.scrollHeight); }"#,
+                )
+            } else {
+                format!(
+                    r#"function target(line) {{
+                      var els = document.querySelectorAll('[data-sourcepos]');
+                      var best = null;
+                      var bestDelta = Infinity;
+                      for (var i = 0; i < els.length; i++) {{
+                        var sp = els[i].getAttribute('data-sourcepos') || '';
+                        var m = sp.match(/^(\d+):\d+-(\d+):/);
+                        if (!m) continue;
+                        var start = parseInt(m[1], 10);
+                        var end = parseInt(m[2], 10);
+                        if (line >= start && line <= end) return els[i];
+                        var delta = line < start ? start - line : line - end;
+                        if (delta < bestDelta) {{ bestDelta = delta; best = els[i]; }}
+                      }}
+                      return best;
+                    }}
+                    function go() {{
+                      var t = target({line});
+                      if (!t) return;
+                      var rect = t.getBoundingClientRect();
+                      window.scrollTo(0, Math.max(0, rect.top + window.scrollY));
+                    }}"#,
+                    line = line,
+                )
+            };
+            let scroll_js = format!(
+                r#"<script>(function(){{
+                  {body}
+                  function settle() {{ go(); setTimeout(go, 150); setTimeout(go, 600); }}
+                  if (document.readyState === 'loading') {{
+                    document.addEventListener('DOMContentLoaded', settle);
+                  }} else {{ settle(); }}
+                  window.addEventListener('load', settle);
+                }})();</script>"#,
+            );
+            final_html.replacen("</body>", &format!("{scroll_js}\n</body>"), 1)
+        } else {
+            final_html
+        };
+
         let path_str = base_dir.to_string_lossy();
         let escaped = glib::Uri::escape_string(&path_str, Some("/"), false).to_string();
         let base_uri = format!("file://{}/", escaped);
+        if std::env::var_os("RMD_DUMP_HTML").is_some() {
+            let _ = std::fs::write("/tmp/rmd-dump.html", &final_html);
+        }
         s.webview.load_html(&final_html, Some(&base_uri));
     }
 
@@ -4988,10 +5203,11 @@ mod tests {
             html.contains("mermaid.run()"),
             "init script should be injected"
         );
-        let bundle_fingerprint = &MERMAID_BUNDLE[..30.min(MERMAID_BUNDLE.len())];
+        // Bundle is referenced as an external <script src=...> pointing at
+        // the cache-extracted copy. (Inlining it broke WebKitGTK.)
         assert!(
-            html.contains(bundle_fingerprint),
-            "bundle should be injected"
+            html.contains("<script src=\"file://") && html.contains("mermaid-"),
+            "bundle should be referenced via <script src>"
         );
     }
 
@@ -5006,6 +5222,23 @@ mod tests {
     fn render_base_href_empty_when_no_dir() {
         let html = render_markdown_to_html("hi", None, false, "doc");
         assert!(html.contains(r#"<base href="">"#));
+    }
+
+    #[test]
+    fn render_emits_data_sourcepos_for_scroll_sync() {
+        let html =
+            render_markdown_to_html("# Title\n\nA paragraph.\n", None, false, "doc");
+        // Heading from line 1 carries its source position; the paragraph from
+        // line 3 carries its own. The mode-toggle scroll sync reads these to
+        // map preview blocks back to source lines.
+        assert!(
+            html.contains(r#"data-sourcepos="1:1-"#),
+            "missing heading sourcepos in: {html}"
+        );
+        assert!(
+            html.contains(r#"data-sourcepos="3:1-"#),
+            "missing paragraph sourcepos in: {html}"
+        );
     }
 
     #[test]
