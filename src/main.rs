@@ -5226,8 +5226,7 @@ mod tests {
 
     #[test]
     fn render_emits_data_sourcepos_for_scroll_sync() {
-        let html =
-            render_markdown_to_html("# Title\n\nA paragraph.\n", None, false, "doc");
+        let html = render_markdown_to_html("# Title\n\nA paragraph.\n", None, false, "doc");
         // Heading from line 1 carries its source position; the paragraph from
         // line 3 carries its own. The mode-toggle scroll sync reads these to
         // map preview blocks back to source lines.
