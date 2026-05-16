@@ -39,6 +39,42 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 1
 fi
 
+# Preflight: check the system libraries the *-sys crates link against. Map
+# each pkg-config name to its Arch package so we can print one install line.
+if command -v pkg-config >/dev/null 2>&1; then
+    missing_pkgs=()
+    # pkg-config name : Arch package
+    deps=(
+        "gtk4:gtk4"
+        "libadwaita-1:libadwaita"
+        "gtksourceview-5:gtksourceview5"
+        "webkitgtk-6.0:webkitgtk-6.0"
+        "javascriptcoregtk-6.0:webkitgtk-6.0"
+    )
+    for dep in "${deps[@]}"; do
+        pc="${dep%%:*}"
+        arch="${dep##*:}"
+        if ! pkg-config --exists "$pc" 2>/dev/null; then
+            missing_pkgs+=("$arch")
+        fi
+    done
+    if (( ${#missing_pkgs[@]} > 0 )); then
+        # de-dupe while preserving order
+        uniq_pkgs=()
+        for p in "${missing_pkgs[@]}"; do
+            [[ " ${uniq_pkgs[*]:-} " == *" $p "* ]] || uniq_pkgs+=("$p")
+        done
+        echo "Missing system libraries required to build RenderMD:" >&2
+        printf '  %s\n' "${uniq_pkgs[@]}" >&2
+        echo >&2
+        echo "Install on Arch / EndeavourOS with:" >&2
+        echo "  sudo pacman -S ${uniq_pkgs[*]}" >&2
+        exit 1
+    fi
+else
+    echo "  (pkg-config not found — skipping system-library preflight)" >&2
+fi
+
 cd "$DIR"
 echo "==> Building release binary"
 cargo build --release
