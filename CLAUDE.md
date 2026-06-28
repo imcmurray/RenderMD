@@ -6,7 +6,17 @@ editor with `F5` or `Ctrl+Shift+E`.
 
 ## Layout
 
-- `src/main.rs` — the entire app (single-file, ~960 lines of Rust)
+- `src/main.rs` — the app shell: UI, actions, preview rendering, scroll
+  sync, file I/O, git history rail, emoji/alert/mermaid preprocessing
+  (~5,400 lines of Rust)
+- `src/tables/` — the markdown table subsystem (parse, model, serialize,
+  render, smart-paste). `mod.rs` documents the design; `main.rs` drives it
+  via the `handle_table_*` methods. This is the one place the app is *not*
+  single-file — it earned its own module.
+- `build.rs` — embeds the short git SHA (`GIT_SHA`) at build time for the
+  About dialog. Falls back to `git rev-parse`, then literal `unknown`.
+- `data/js/mermaid.min.js` — vendored Mermaid bundle, embedded via
+  `include_str!` and served to the WebView from a `OnceLock` URI.
 - `Cargo.toml` — crate manifest
 - `rendermd` — bash launcher; resolves the release binary next to itself
 - `io.github.rendermd.RenderMD.desktop` — Budgie menu entry + `.md` MIME
@@ -49,8 +59,9 @@ App ID: `io.github.rendermd.RenderMD`. Settings:
 
 ## Conventions
 
-- Single-file app. Don't split `src/main.rs` into modules unless it earns its
-  keep.
+- Mostly-single-file app: keep new code in `src/main.rs` unless it earns its
+  own module the way `src/tables/` did (a self-contained subsystem with its
+  own tests). Don't split `main.rs` up for its own sake.
 - Keep the preview CSS in the three string constants at the top of the file
   (`PREVIEW_CSS_LIGHT`, `PREVIEW_CSS_DARK`, `PREVIEW_CSS_BASE`). The base
   stylesheet uses CSS variables so the same rules work in both themes.
