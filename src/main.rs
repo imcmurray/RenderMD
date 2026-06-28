@@ -349,46 +349,135 @@ th.rmd-cell { position: relative; }
   left: 8px;
   top: 24px;
   bottom: 24px;
-  width: 22px;
+  width: 150px;
   display: flex;
   flex-direction: column;
-  align-items: center;
+  align-items: stretch;
   z-index: 50;
   overflow-y: auto;
   scrollbar-width: thin;
+  padding: 4px 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
+}
+/* Reserve a gutter so document text never slides under the open rail. */
+body:has(.rmd-history-rail) {
+  padding-left: max(180px, 8vw);
 }
 .rmd-history-track {
   position: absolute;
   top: 8px;
   bottom: 8px;
-  left: 50%;
-  transform: translateX(-50%);
+  left: 13px;
   width: 1px;
   background: var(--border);
   pointer-events: none;
 }
 .rmd-history-circle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 3px 8px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
+  text-align: left;
+  border-radius: 5px;
+  transition: background 0.12s ease;
+}
+.rmd-history-circle:hover {
+  background: var(--code-bg);
+}
+.rmd-history-dot {
   width: 10px;
   height: 10px;
   border-radius: 50%;
   background: var(--muted);
   border: 1px solid var(--bg);
-  margin: 5px 0;
-  padding: 0;
-  cursor: pointer;
-  position: relative;
-  z-index: 1;
-  transition: transform 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
   flex-shrink: 0;
+  transition: transform 0.12s ease, background 0.12s ease, box-shadow 0.12s ease;
 }
-.rmd-history-circle:hover {
-  transform: scale(1.5);
+.rmd-history-circle:hover .rmd-history-dot {
+  transform: scale(1.4);
   background: var(--accent);
   box-shadow: 0 0 6px var(--accent);
 }
-.rmd-history-circle.rmd-history-active {
+.rmd-history-circle.rmd-history-active .rmd-history-dot {
   background: var(--accent);
   box-shadow: 0 0 8px var(--accent);
+}
+.rmd-history-circle.rmd-history-active .rmd-history-when {
+  color: var(--fg);
+  font-weight: 600;
+}
+.rmd-history-info {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  min-width: 0;
+}
+.rmd-history-when {
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.rmd-history-stat {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  gap: 6px;
+}
+.rmd-history-add { color: var(--alert-tip); }
+.rmd-history-del { color: var(--alert-caution); }
+.rmd-history-collapse {
+  align-self: flex-end;
+  margin: 0 4px 2px 0;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  flex-shrink: 0;
+  z-index: 2;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.rmd-history-collapse:hover {
+  background: var(--code-bg);
+  color: var(--accent);
+}
+/* Collapsed: compact dots-only column, labels hidden. */
+.rmd-history-rail.rmd-collapsed {
+  width: 30px;
+}
+.rmd-history-rail.rmd-collapsed .rmd-history-info {
+  display: none;
+}
+.rmd-history-rail.rmd-collapsed .rmd-history-circle {
+  justify-content: center;
+  padding: 3px 0;
+}
+.rmd-history-rail.rmd-collapsed .rmd-history-collapse {
+  align-self: center;
+  margin: 0 0 2px 0;
+}
+.rmd-history-rail.rmd-collapsed .rmd-history-track {
+  left: 50%;
+  transform: translateX(-50%);
+}
+body:has(.rmd-history-rail.rmd-collapsed) {
+  padding-left: max(58px, 8vw);
 }
 .rmd-history-hint {
   position: fixed;
@@ -1197,6 +1286,8 @@ struct Commit {
     short_sha: String,
     iso_date: String,
     subject: String,
+    additions: u32,
+    deletions: u32,
 }
 
 // State for "viewing a historical revision" mode. The buffer is left
@@ -1245,13 +1336,17 @@ fn fetch_git_history(file_path: &Path) -> Option<Vec<Commit>> {
         return None;
     }
 
+    // `--numstat` appends per-file "added<TAB>deleted<TAB>path" lines after
+    // each commit. We prefix the pretty header with \x01 (SOH) so the two
+    // line kinds are unambiguous to parse — content never contains it.
     let output = std::process::Command::new("git")
         .args([
             "log",
             "--follow",
             "-n",
             "100",
-            "--pretty=format:%H%x09%h%x09%cI%x09%s",
+            "--numstat",
+            "--pretty=format:\x01%H%x09%h%x09%cI%x09%s",
             "--",
             file_name,
         ])
@@ -1263,23 +1358,80 @@ fn fetch_git_history(file_path: &Path) -> Option<Vec<Commit>> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let commits: Vec<Commit> = stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(4, '\t');
-            Some(Commit {
-                sha: parts.next()?.to_string(),
-                short_sha: parts.next()?.to_string(),
-                iso_date: parts.next()?.to_string(),
-                subject: parts.next()?.to_string(),
-            })
-        })
-        .collect();
+    let mut commits: Vec<Commit> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(header) = line.strip_prefix('\x01') {
+            let mut parts = header.splitn(4, '\t');
+            let (Some(sha), Some(short_sha), Some(iso_date), Some(subject)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            commits.push(Commit {
+                sha: sha.to_string(),
+                short_sha: short_sha.to_string(),
+                iso_date: iso_date.to_string(),
+                subject: subject.to_string(),
+                additions: 0,
+                deletions: 0,
+            });
+        } else if !line.trim().is_empty() {
+            // numstat row for the current commit: "added\tdeleted\tpath".
+            // Binary files report "-" for both; parse failures count as 0.
+            if let Some(c) = commits.last_mut() {
+                let mut p = line.splitn(3, '\t');
+                c.additions += p.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+                c.deletions += p.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+            }
+        }
+    }
     if commits.is_empty() {
         None
     } else {
         Some(commits)
     }
+}
+
+// Format a strict-ISO commit date ("2026-06-27T23:49:12-06:00") as a compact
+// "YYYY-MM-DD HH:MM" for the history rail. Falls back to the raw date portion
+// if the time can't be extracted.
+fn format_commit_datetime(iso: &str) -> String {
+    let mut sp = iso.splitn(2, 'T');
+    let date = sp.next().unwrap_or(iso);
+    let time = sp.next().unwrap_or("");
+    let hm: String = time.chars().take(5).collect();
+    if hm.len() == 5 {
+        format!("{date} {hm}")
+    } else {
+        date.to_string()
+    }
+}
+
+// Compact "time ago" label for the history rail ("just now", "5m ago",
+// "3h ago", "2d ago", "4w ago", "6mo ago", "2y ago"). Returns "" when the
+// timestamp can't be parsed (0) so the caller can fall back to the date.
+fn format_relative_time(then_secs: i64, now_secs: i64) -> String {
+    if then_secs <= 0 {
+        return String::new();
+    }
+    let d = now_secs - then_secs;
+    if d < 60 {
+        return "just now".to_string();
+    }
+    let (n, unit) = if d < 3_600 {
+        (d / 60, "m")
+    } else if d < 86_400 {
+        (d / 3_600, "h")
+    } else if d < 604_800 {
+        (d / 86_400, "d")
+    } else if d < 2_592_000 {
+        (d / 604_800, "w")
+    } else if d < 31_536_000 {
+        (d / 2_592_000, "mo")
+    } else {
+        (d / 31_536_000, "y")
+    };
+    format!("{n}{unit} ago")
 }
 
 // Resolve the working tree's toplevel and the file's path relative to
@@ -1450,7 +1602,12 @@ fn html_escape(input: &str) -> String {
 // Empty string when there's no history. When `visible` is false but
 // commits exist, returns just an unobtrusive hint dot so the user
 // knows the option is there.
-fn build_history_rail_html(commits: &[Commit], viewing_sha: Option<&str>, visible: bool) -> String {
+fn build_history_rail_html(
+    commits: &[Commit],
+    viewing_sha: Option<&str>,
+    visible: bool,
+    collapsed: bool,
+) -> String {
     if commits.is_empty() {
         return String::new();
     }
@@ -1470,24 +1627,54 @@ fn build_history_rail_html(commits: &[Commit], viewing_sha: Option<&str>, visibl
             .to_string();
     }
 
-    let mut html = String::from(
-        r#"<div class="rmd-history-rail" role="navigation" aria-label="Commit history">"#,
+    let rail_cls = if collapsed {
+        "rmd-history-rail rmd-collapsed"
+    } else {
+        "rmd-history-rail"
+    };
+    let mut html = format!(
+        r#"<div class="{rail_cls}" role="navigation" aria-label="Commit history">"#,
     );
+    // Collapse/expand toggle: chevron points the way it will move the panel.
+    let (chevron, collapse_title) = if collapsed {
+        ("»", "Expand history labels")
+    } else {
+        ("«", "Collapse to dots")
+    };
+    html.push_str(&format!(
+        r#"<button type="button" class="rmd-history-collapse" title="{title}" aria-label="{title}">{chevron}</button>"#,
+        title = html_escape(collapse_title),
+        chevron = chevron,
+    ));
     html.push_str(r#"<div class="rmd-history-track"></div>"#);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     for c in commits {
         let active = viewing_sha.map(|v| v == c.sha).unwrap_or(false);
-        let date = c.iso_date.split('T').next().unwrap_or(&c.iso_date);
-        let tooltip = format!("{} — {}\n{}", c.short_sha, date, c.subject);
+        let when_abs = format_commit_datetime(&c.iso_date);
+        // Visible label is relative ("2d ago"); the absolute date stays in the
+        // hover tooltip. Fall back to the absolute date if it won't parse.
+        let rel = format_relative_time(iso_to_unix_secs(&c.iso_date), now_secs);
+        let when_label = if rel.is_empty() { when_abs.clone() } else { rel };
+        let tooltip = format!(
+            "{} — {}\n+{} −{}\n{}",
+            c.short_sha, when_abs, c.additions, c.deletions, c.subject
+        );
         let cls = if active {
             "rmd-history-circle rmd-history-active"
         } else {
             "rmd-history-circle"
         };
         html.push_str(&format!(
-            r#"<button type="button" class="{cls}" data-sha="{sha}" title="{title}"></button>"#,
+            r#"<button type="button" class="{cls}" data-sha="{sha}" title="{title}"><span class="rmd-history-dot"></span><span class="rmd-history-info"><span class="rmd-history-when">{when}</span><span class="rmd-history-stat"><span class="rmd-history-add">+{add}</span><span class="rmd-history-del">−{del}</span></span></span></button>"#,
             cls = cls,
             sha = html_escape(&c.sha),
             title = html_escape(&tooltip),
+            when = html_escape(&when_label),
+            add = c.additions,
+            del = c.deletions,
         ));
     }
     html.push_str("</div>");
@@ -1498,12 +1685,20 @@ fn build_history_rail_html(commits: &[Commit], viewing_sha: Option<&str>, visibl
         r#"<script>
 (function() {
   var msg = (window.webkit && window.webkit.messageHandlers) || null;
-  if (!msg || !msg.commitClick) return;
-  document.querySelectorAll(".rmd-history-circle").forEach(function(c) {
-    c.addEventListener("click", function() {
-      msg.commitClick.postMessage(c.getAttribute("data-sha") || "");
+  if (!msg) return;
+  if (msg.commitClick) {
+    document.querySelectorAll(".rmd-history-circle").forEach(function(c) {
+      c.addEventListener("click", function() {
+        msg.commitClick.postMessage(c.getAttribute("data-sha") || "");
+      });
     });
-  });
+  }
+  if (msg.toggleHistoryCollapse) {
+    var tog = document.querySelector(".rmd-history-collapse");
+    if (tog) tog.addEventListener("click", function() {
+      msg.toggleHistoryCollapse.postMessage("");
+    });
+  }
 })();
 </script>"#,
     );
@@ -2245,10 +2440,13 @@ struct StateInner {
     // current file (None if the file isn't in a git repo).
     // `viewing_snapshot` holds the historical revision the preview is
     // rendering from, or None for the working copy. `history_visible`
-    // toggles the rail on/off.
+    // toggles the rail on/off; `history_rail_collapsed` toggles between the
+    // labeled panel (date/time + change counts) and the compact dots-only
+    // column while the rail stays shown.
     git_history: RefCell<Option<Vec<Commit>>>,
     viewing_snapshot: RefCell<Option<HistorySnapshot>>,
     history_visible: Cell<bool>,
+    history_rail_collapsed: Cell<bool>,
 
     // Set by `handle_table_navigate` and consumed by the next
     // `refresh_preview`: tells the WebView which cell to focus
@@ -2332,6 +2530,7 @@ impl State {
             git_history: RefCell::new(None),
             viewing_snapshot: RefCell::new(None),
             history_visible: Cell::new(true),
+            history_rail_collapsed: Cell::new(false),
             pending_focus_cell: RefCell::new(None),
             pending_scroll_line: Cell::new(None),
             table_sort_snapshots: RefCell::new(HashMap::new()),
@@ -2846,6 +3045,7 @@ impl State {
         manager.register_script_message_handler("imageMove", None);
         manager.register_script_message_handler("commitClick", None);
         manager.register_script_message_handler("toggleHistory", None);
+        manager.register_script_message_handler("toggleHistoryCollapse", None);
         manager.register_script_message_handler("scrollTo", None);
         manager.register_script_message_handler("tableEdit", None);
         manager.register_script_message_handler("tableNavigate", None);
@@ -2872,6 +3072,10 @@ impl State {
         let st = self.clone();
         manager.connect_script_message_received(Some("toggleHistory"), move |_, _value| {
             st.action_toggle_history();
+        });
+        let st = self.clone();
+        manager.connect_script_message_received(Some("toggleHistoryCollapse"), move |_, _value| {
+            st.action_toggle_history_collapse();
         });
         let st = self.clone();
         manager.connect_script_message_received(Some("tableEdit"), move |_, value| {
@@ -3942,8 +4146,12 @@ impl State {
         let final_html = match s.git_history.borrow().as_ref() {
             Some(commits) => {
                 let viewing = s.viewing_snapshot.borrow().as_ref().map(|s| s.sha.clone());
-                let rail =
-                    build_history_rail_html(commits, viewing.as_deref(), s.history_visible.get());
+                let rail = build_history_rail_html(
+                    commits,
+                    viewing.as_deref(),
+                    s.history_visible.get(),
+                    s.history_rail_collapsed.get(),
+                );
                 if rail.is_empty() {
                     html_with_tables
                 } else {
@@ -4879,6 +5087,16 @@ impl State {
         }
     }
 
+    // Collapse/expand the rail between the labeled panel and the compact
+    // dots-only column. Only meaningful while the rail is shown.
+    fn action_toggle_history_collapse(&self) {
+        let now = !self.inner.history_rail_collapsed.get();
+        self.inner.history_rail_collapsed.set(now);
+        if self.inner.mode.borrow().as_str() == MODE_PREVIEW {
+            self.refresh_preview();
+        }
+    }
+
     // -- Window + UI settings persistence -------------------------------
     fn restore_window_state(&self) {
         let path = settings_file();
@@ -4902,6 +5120,8 @@ impl State {
         // should see the rail when they open something in a git repo.
         let history = kf.boolean("ui", "history-visible").unwrap_or(true);
         self.inner.history_visible.set(history);
+        let collapsed = kf.boolean("ui", "history-rail-collapsed").unwrap_or(false);
+        self.inner.history_rail_collapsed.set(collapsed);
     }
 
     fn save_window_state(&self) {
@@ -4915,6 +5135,11 @@ impl State {
         kf.set_integer("window", "height", h);
         kf.set_boolean("window", "maximized", self.inner.window.is_maximized());
         kf.set_boolean("ui", "history-visible", self.inner.history_visible.get());
+        kf.set_boolean(
+            "ui",
+            "history-rail-collapsed",
+            self.inner.history_rail_collapsed.get(),
+        );
         let _ = kf.save_to_file(settings_file());
     }
 }
