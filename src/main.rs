@@ -328,17 +328,39 @@ th.rmd-cell { position: relative; }
 .rmd-th-resize-handle {
   position: absolute;
   top: 0;
-  right: -3px;
-  width: 6px;
+  right: -5px;
+  width: 10px;
   height: 100%;
   cursor: col-resize;
   z-index: 3;
   user-select: none;
+  touch-action: none;
 }
-.rmd-th-resize-handle:hover,
-.rmd-th-resize-handle.rmd-resizing {
+/* Grip bar centered on the column boundary. Hidden at rest so tables look
+   unchanged; revealed faintly when the pointer is anywhere over the header
+   row (so the resize affordance is discoverable), and fully highlighted on
+   the handle itself or while dragging. */
+.rmd-th-resize-handle::before {
+  content: "";
+  position: absolute;
+  top: 20%;
+  bottom: 20%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 3px;
+  border-radius: 2px;
   background: var(--accent);
-  opacity: 0.4;
+  opacity: 0;
+  transition: opacity 0.12s ease, top 0.12s ease, bottom 0.12s ease;
+}
+thead:hover .rmd-th-resize-handle::before {
+  opacity: 0.35;
+}
+.rmd-th-resize-handle:hover::before,
+.rmd-th-resize-handle.rmd-resizing::before {
+  opacity: 1;
+  top: 6%;
+  bottom: 6%;
 }
 .rmd-resizing-table, .rmd-resizing-table * {
   cursor: col-resize !important;
