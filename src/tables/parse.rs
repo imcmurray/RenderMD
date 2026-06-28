@@ -4,7 +4,6 @@
 //! every event — those ranges become each cell's `source_range`, which
 //! is what makes minimum-diff cell patching possible.
 
-use std::collections::HashMap;
 use std::ops::Range;
 
 use pulldown_cmark::{Alignment as PdAlignment, Event, Options, Parser, Tag, TagEnd};
@@ -185,7 +184,6 @@ fn collect_table(
         rows,
         style: TableStyle::PreserveOriginal,
         column_widths: vec![None; n_cols],
-        formulas: HashMap::new(),
         original_lines,
         sort_indicator: None,
     };
@@ -237,30 +235,6 @@ pub fn cell_from_range(buf: &str, r: Range<usize>) -> Cell {
         content: raw.trim().to_string(),
         leading_ws,
         trailing_ws,
-    }
-}
-
-/// Detect the formatting style of a parsed table source. Used by the
-/// `Reformat Table` command and by smart-paste to pick a target style;
-/// `parse_tables` itself always defaults parsed tables to
-/// [`TableStyle::PreserveOriginal`].
-pub fn detect_style(table_src: &str) -> TableStyle {
-    let body_lines: Vec<&str> = table_src
-        .lines()
-        .filter(|l| !is_separator_line(l) && !l.trim().is_empty())
-        .collect();
-
-    let has_wide_pad = body_lines
-        .iter()
-        .any(|l| l.contains("  |") || l.contains("|  "));
-    let has_uniform_compact = body_lines
-        .iter()
-        .all(|l| !l.contains("  |") && !l.contains("|  "));
-
-    match (has_wide_pad, has_uniform_compact) {
-        (true, _) => TableStyle::Pretty,
-        (false, true) => TableStyle::Compact,
-        _ => TableStyle::PreserveOriginal,
     }
 }
 
@@ -433,14 +407,6 @@ mod tests {
         assert!(is_separator_line("| :---: | :---: |"));
         assert!(!is_separator_line("| a | b |"));
         assert!(!is_separator_line("|||"));
-    }
-
-    #[test]
-    fn detects_pretty_compact_preserve() {
-        let compact = "| a | b |\n|---|---|\n| 1 | 2 |\n";
-        let pretty = "| name  | score |\n|-------|------:|\n| Alice |    42 |\n";
-        assert_eq!(detect_style(compact), TableStyle::Compact);
-        assert_eq!(detect_style(pretty), TableStyle::Pretty);
     }
 
     #[test]

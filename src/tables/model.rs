@@ -3,7 +3,6 @@
 //! Everything here is parser- and renderer-agnostic; [`parse`](super::parse)
 //! and [`serialize`](super::serialize) plug into these types.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 
@@ -43,11 +42,6 @@ pub struct MarkdownTable {
     /// gracefully in viewers that don't recognise the comment).
     /// `None` per column = auto-size.
     pub column_widths: Vec<Option<u32>>,
-
-    /// Cached formulas keyed by `(row, col)` where `row == -1` is the
-    /// header. The source of truth is HTML-comment sidecar metadata
-    /// adjacent to the table, so the markdown stays portable.
-    pub formulas: HashMap<(i32, usize), String>,
 
     /// Captured raw line bytes, populated only when
     /// `style == TableStyle::PreserveOriginal`. Lets [`update_cell`]
@@ -99,7 +93,10 @@ pub enum Alignment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableStyle {
     /// `| a | b |` — single-space padding, no column alignment.
-    /// Always reformats on edit.
+    /// Always reformats on edit. Fully handled by the serializer, but no
+    /// UI path currently selects it (there's no "compact" command yet);
+    /// kept as a complete member of the style enum.
+    #[allow(dead_code)]
     Compact,
     /// `| a   | b   |` — pretty-printed with column widths recomputed.
     /// Default for *newly created* tables.
@@ -258,7 +255,12 @@ pub struct NavTarget {
 }
 
 /// Errors produced by the table subsystem.
+///
+/// Some variants aren't returned by any current code path (CSV/HTML import
+/// and table-lookup-by-id aren't wired into the editor yet) but are kept so
+/// the error type is complete and stable for callers that match on it.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum TableError {
     CellOutOfRange { row: i32, col: usize },
     TableNotFound(TableId),
@@ -288,11 +290,6 @@ impl std::error::Error for TableError {}
 pub type Result<T> = std::result::Result<T, TableError>;
 
 impl MarkdownTable {
-    /// Total cell count (header + all body cells).
-    pub fn cell_count(&self) -> usize {
-        self.headers.len() + self.rows.iter().map(Vec::len).sum::<usize>()
-    }
-
     /// Borrow a cell. `row == -1` is the header.
     pub fn cell(&self, row: i32, col: usize) -> Result<&Cell> {
         if row == -1 {
@@ -606,16 +603,9 @@ mod tests {
             ]],
             style: TableStyle::Compact,
             column_widths: vec![None, None],
-            formulas: HashMap::new(),
             original_lines: None,
             sort_indicator: None,
         }
-    }
-
-    #[test]
-    fn cell_count_counts_header_and_body() {
-        let t = sample_table();
-        assert_eq!(t.cell_count(), 4);
     }
 
     #[test]

@@ -14,8 +14,6 @@
 //! whole-table re-serialization (Pretty / Compact) based on the
 //! table's [`TableStyle`].
 
-use std::ops::Range;
-
 use super::model::*;
 use super::parse::{capture_original_lines, split_cells};
 
@@ -1279,7 +1277,6 @@ mod tests {
             rows: vec![],
             style: TableStyle::PreserveOriginal,
             column_widths: vec![],
-            formulas: Default::default(),
             original_lines: None,
             sort_indicator: None,
         };

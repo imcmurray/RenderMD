@@ -33,20 +33,15 @@
 //! See `parse::parse_tables`, `MarkdownTable::update_cell`, and the
 //! `paste` module for the three load-bearing entry points.
 
-// Scaffolding for the table editor — wired into webview commands in a
-// follow-up. Allowing dead_code / unused_imports until the integration
-// layer (click-to-edit, smart paste) consumes these re-exports.
-#![allow(dead_code, unused_imports)]
-
 pub mod model;
 pub mod parse;
 pub mod paste;
 pub mod render;
 pub mod serialize;
 
-pub use model::{
-    Alignment, Cell, EditDelta, LineKind, MarkdownTable, OriginalLine, Result, TableError, TableId,
-    TableStyle,
-};
+// Top-level re-exports for the symbols the editor reaches as `tables::*`.
+// Other types (Cell, Alignment, etc.) are reached via their `tables::model::*`
+// path and don't need re-exporting here.
+pub use model::{EditDelta, TableId, TableStyle};
 pub use parse::parse_tables;
 pub use paste::{detect_table_paste, paste_to_gfm, TablePaste};

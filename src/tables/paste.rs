@@ -12,8 +12,6 @@
 //! Anything else returns [`TablePaste::None`] so the editor's normal
 //! paste path runs.
 
-use std::collections::HashMap;
-
 use super::model::*;
 use super::serialize::{to_gfm_compact, to_gfm_pretty};
 
@@ -52,18 +50,6 @@ pub enum TablePaste {
 }
 
 impl TablePaste {
-    /// Origin descriptor for UI toasts: "html", "tsv", "csv", "gfm",
-    /// or "plain".
-    pub fn origin(&self) -> &'static str {
-        match self {
-            TablePaste::Html { .. } => "html",
-            TablePaste::Gfm { .. } => "gfm",
-            TablePaste::Tsv { .. } => "tsv",
-            TablePaste::Csv { .. } => "csv",
-            TablePaste::None => "plain",
-        }
-    }
-
     /// `Some((rows, cols))` for table variants, `None` otherwise.
     pub fn shape(&self) -> Option<(usize, usize)> {
         match self {
@@ -467,7 +453,6 @@ fn rows_to_gfm(rows: Vec<Vec<String>>, style: TableStyle) -> Option<String> {
             .collect(),
         style,
         column_widths: vec![None; cols],
-        formulas: HashMap::new(),
         original_lines: None,
         sort_indicator: None,
     };
