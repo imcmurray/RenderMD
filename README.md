@@ -2,7 +2,20 @@
   <img src="data/icons/hicolor/scalable/apps/io.github.rendermd.RenderMD.svg" alt="RenderMD" width="128" height="128">
 </p>
 
-<h1 align="center">RenderMD</h1>
+<h1 align="center">RenderMD <sub>(GTK — archived)</sub></h1>
+
+<blockquote>
+  <strong>⚠️ This repository is archived and no longer maintained.</strong>
+  RenderMD has been rewritten on <strong>Tauri 2</strong> and now ships
+  cross-platform (macOS, Windows, Linux) with in-app auto-updates. All
+  development continues at
+  <a href="https://github.com/imcmurray/RenderMD-Tauri"><strong>imcmurray/RenderMD-Tauri</strong></a>.
+  <br><br>
+  This GTK4 version was Linux-only (WebKitGTK has no Windows/macOS port).
+  The pure-Rust markdown pipeline and the entire table subsystem live on in
+  the successor as the <code>rendermd-core</code> crate. <code>v1.3.1</code>
+  is the final GTK release; the code here remains available for reference.
+</blockquote>
 
 <p align="center">
   A native GTK4 Markdown viewer/editor for EndeavourOS / Arch + Budgie,
